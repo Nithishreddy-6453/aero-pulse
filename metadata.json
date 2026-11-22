@@ -1,0 +1,6 @@
+{
+  "name": "AtmosClear — Atmospheric Intelligence",
+  "description": "High-clarity daylight atmospheric intelligence and environmental telemetry platform for air quality monitoring, particulate analytics, and health protocol management.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
