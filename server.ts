@@ -14,8 +14,22 @@ const OSM_USER_AGENT = 'AeroPulse-UrbanAirAssistant/1.0 (https://aeropulse.local
 const CACHE_TTL_MS = 15 * 60 * 1000;
 const QUOTA_COOLDOWN_MS = 5 * 60 * 1000;
 
+let preferredWorkingGeminiKey: string | null = null;
+const invalidAuthGeminiKeys = new Set<string>();
+
+function getCandidateGeminiApiKeys(): string[] {
+  const rawKeys = [
+    preferredWorkingGeminiKey,
+    (process.env.GEMINI_API_KE || '').trim(),
+    (process.env.GEMINI_API_KEY || '').trim(),
+  ].filter(
+    (k): k is string => Boolean(k && k.length > 0 && !invalidAuthGeminiKeys.has(k))
+  );
+  return Array.from(new Set(rawKeys));
+}
+
 function getGeminiApiKey(): string {
-  return (process.env.GEMINI_API_KEY || '').trim();
+  return getCandidateGeminiApiKeys()[0] || '';
 }
 
 function createGeminiClient(apiKey: string) {
@@ -32,6 +46,166 @@ function createGeminiClient(apiKey: string) {
 function isQuotaExhaustedError(err: unknown): boolean {
   const raw = err instanceof Error ? err.message : String(err);
   return /429|RESOURCE_EXHAUSTED|quota|rate.?limit/i.test(raw);
+}
+
+function getNumericErrorStatus(err: unknown): number | null {
+  if (typeof err === 'object' && err !== null && 'status' in err) {
+    const s = Number((err as { status?: unknown }).status);
+    if (Number.isFinite(s) && s >= 100 && s < 600) return s;
+  }
+  const raw = err instanceof Error ? err.message : String(err);
+  const match = raw.match(/\b(400|401|403|404|429|500|502|503|504)\b/);
+  return match ? Number(match[1]) : null;
+}
+
+function sanitizeErrorSnippet(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  return raw
+    .replace(/AIza[0-9A-Za-z_-]{10,}/g, '[REDACTED_KEY]')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 220);
+}
+
+function isAuthOrKeyError(err: unknown): boolean {
+  const status = getNumericErrorStatus(err);
+  const raw = err instanceof Error ? err.message : String(err);
+  return (
+    status === 401 ||
+    status === 403 ||
+    /PERMISSION_DENIED|API_KEY_INVALID|API key not valid|UNAUTHENTICATED|invalid.?api.?key/i.test(raw)
+  );
+}
+
+function shouldFallbackModel(err: unknown): boolean {
+  if (isAuthOrKeyError(err)) return false;
+  return true;
+}
+
+function cleanJsonResponseText(raw: string): string {
+  const trimmed = raw.trim();
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  return (fenced ? fenced[1] : trimmed).trim();
+}
+
+const GEMINI_FALLBACK_MODELS = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'] as const;
+type GeminiFallbackModel = (typeof GEMINI_FALLBACK_MODELS)[number];
+const MODEL_OVERLOAD_COOLDOWN_MS = 60 * 1000;
+const modelCooldownUntil = new Map<GeminiFallbackModel, number>();
+
+function isTransientUpstreamError(err: unknown): boolean {
+  const status = getNumericErrorStatus(err);
+  const raw = err instanceof Error ? err.message : String(err);
+  return (
+    status === 500 ||
+    status === 502 ||
+    status === 503 ||
+    status === 504 ||
+    /UNAVAILABLE|high demand|overloaded|DEADLINE_EXCEEDED|TIMED_OUT|fetch failed/i.test(raw)
+  );
+}
+
+function delayMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withAttemptTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return new Promise<T>((resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`TIMED_OUT: ${label} exceeded ${timeoutMs}ms`));
+    }, timeoutMs);
+    promise.then(
+      (val) => {
+        if (timer) clearTimeout(timer);
+        resolve(val);
+      },
+      (err) => {
+        if (timer) clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
+async function executeWithGeminiFallback<T>(
+  routeTag: string,
+  runner: (ai: GoogleGenAI, model: GeminiFallbackModel) => Promise<T>
+): Promise<{ result: T; model: GeminiFallbackModel }> {
+  const keys = getCandidateGeminiApiKeys();
+  if (keys.length === 0) {
+    throw new Error('GEMINI_KEY_MISSING');
+  }
+
+  let lastError: unknown = null;
+
+  for (const apiKey of keys) {
+    const ai = createGeminiClient(apiKey);
+    let keyAuthFailed = false;
+
+    const now = Date.now();
+    const hydrogenCoolingDown = (modelCooldownUntil.get('gemini-4-hydrogen') ?? 0) > now;
+    const attemptPlan: Array<{ model: GeminiFallbackModel; backoffMs: number; timeoutMs: number }> =
+      hydrogenCoolingDown
+        ? [
+            { model: 'gemini-3.1-flash-lite', backoffMs: 0, timeoutMs: 8000 },
+            { model: 'gemini-3.1-flash-lite', backoffMs: 600, timeoutMs: 8000 },
+            { model: 'gemini-4-hydrogen', backoffMs: 600, timeoutMs: 9000 },
+          ]
+        : [
+            { model: 'gemini-4-hydrogen', backoffMs: 0, timeoutMs: 8500 },
+            { model: 'gemini-3.1-flash-lite', backoffMs: 0, timeoutMs: 8500 },
+            { model: 'gemini-3.1-flash-lite', backoffMs: 600, timeoutMs: 8500 },
+          ];
+
+    for (let i = 0; i < attemptPlan.length; i++) {
+      const { model, backoffMs, timeoutMs } = attemptPlan[i];
+      if (backoffMs > 0) {
+        await delayMs(backoffMs);
+      }
+      try {
+        const result = await withAttemptTimeout(
+          runner(ai, model),
+          timeoutMs,
+          `${routeTag}/${model}`
+        );
+        preferredWorkingGeminiKey = apiKey;
+        return { result, model };
+      } catch (err) {
+        lastError = err;
+        if (isAuthOrKeyError(err)) {
+          keyAuthFailed = true;
+          invalidAuthGeminiKeys.add(apiKey);
+          break;
+        }
+        if (model === 'gemini-4-hydrogen' && (isTransientUpstreamError(err) || isQuotaExhaustedError(err))) {
+          modelCooldownUntil.set('gemini-4-hydrogen', Date.now() + MODEL_OVERLOAD_COOLDOWN_MS);
+        }
+        if (i === 0 && shouldFallbackModel(err)) {
+          continue;
+        }
+        if (isTransientUpstreamError(err)) {
+          continue;
+        }
+        break;
+      }
+    }
+
+    if (keyAuthFailed) {
+      if (preferredWorkingGeminiKey === apiKey) {
+        preferredWorkingGeminiKey = null;
+      }
+      continue;
+    }
+
+    if (isQuotaExhaustedError(lastError)) {
+      continue;
+    }
+
+    break;
+  }
+
+  throw lastError ?? new Error('Gemini request failed.');
 }
 
 function sanitizeServerInput(raw: unknown, maxLength = 240): string {
@@ -609,7 +783,6 @@ async function fetchGeminiCommuteTip(params: {
     return { insight: null, quotaLimited: true };
   }
 
-  const ai = createGeminiClient(geminiKey);
   const prompt = [
     `You are AeroPulse, an urban air-quality commute advisor for Indian families.`,
     `Route: "${params.origin}" to "${params.destination}" (${params.cityName}, India).`,
@@ -618,8 +791,8 @@ async function fetchGeminiCommuteTip(params: {
     `Plain text only. No markdown, no bullets, no greetings.`,
   ].join('\n');
 
-  for (const model of ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'] as const) {
-    try {
+  try {
+    const { result: text } = await executeWithGeminiFallback('commute', async (ai, model) => {
       const response = await ai.models.generateContent({
         model,
         contents: prompt,
@@ -628,23 +801,18 @@ async function fetchGeminiCommuteTip(params: {
             ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
             : undefined,
       });
-      const text = (response.text || '').replace(/\s+/g, ' ').trim();
-      const resObj = { insight: text || null, quotaLimited: false };
-      commuteTipCache.set(cacheKey, { ...resObj, expiresAt: Date.now() + CACHE_TTL_MS });
-      return resObj;
-    } catch (err) {
-      if (isQuotaExhaustedError(err)) {
-        if (model === 'gemini-3.1-flash-lite') {
-          commuteGeminiCooldownUntil = Date.now() + QUOTA_COOLDOWN_MS;
-          return { insight: null, quotaLimited: true };
-        }
-        continue;
-      }
-      return { insight: null, quotaLimited: false };
+      return (response.text || '').replace(/\s+/g, ' ').trim();
+    });
+    const resObj = { insight: text || null, quotaLimited: false };
+    commuteTipCache.set(cacheKey, { ...resObj, expiresAt: Date.now() + CACHE_TTL_MS });
+    return resObj;
+  } catch (err) {
+    if (isQuotaExhaustedError(err)) {
+      commuteGeminiCooldownUntil = Date.now() + QUOTA_COOLDOWN_MS;
+      return { insight: null, quotaLimited: true };
     }
+    return { insight: null, quotaLimited: false };
   }
-
-  return { insight: null, quotaLimited: true };
 }
 
 function sanitizeDiagnosis(raw: unknown): RoomVisionDiagnosis {
@@ -1403,7 +1571,6 @@ async function startServer() {
       return;
     }
 
-    const ai = createGeminiClient(geminiKey);
     const activeRisksText =
       riskChips.length > 0 ? riskChips.join(', ') : 'Standard urban apartment';
 
@@ -1428,66 +1595,60 @@ async function startServer() {
       },
     };
 
-    let lastError: unknown = null;
+    try {
+      const { result: diagnosis } = await executeWithGeminiFallback(
+        'room-audit',
+        async (ai, model) => {
+          const response = await ai.models.generateContent({
+            model,
+            contents: { parts: [imagePart, { text: prompt }] },
+            config: {
+              responseMimeType: 'application/json',
+              responseSchema: ROOM_AUDIT_SCHEMA,
+              ...(model === 'gemini-4-hydrogen'
+                ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+                : {}),
+            },
+          });
 
-    for (const model of ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'] as const) {
-      try {
-        const response = await ai.models.generateContent({
-          model,
-          contents: { parts: [imagePart, { text: prompt }] },
-          config: {
-            responseMimeType: 'application/json',
-            responseSchema: ROOM_AUDIT_SCHEMA,
-            ...(model === 'gemini-4-hydrogen'
-              ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
-              : {}),
-          },
-        });
+          const jsonStr = cleanJsonResponseText(response.text || '');
+          if (!jsonStr) {
+            throw new Error('Empty JSON returned by Gemini Vision.');
+          }
 
-        const jsonStr = (response.text || '').trim();
-        if (!jsonStr) {
-          throw new Error('Empty JSON returned by Gemini Vision.');
+          const parsed = JSON.parse(jsonStr);
+          const sanitized = sanitizeDiagnosis(parsed);
+          sanitized.modelUsed = model;
+          return sanitized;
         }
+      );
 
-        const parsed = JSON.parse(jsonStr);
-        const diagnosis = sanitizeDiagnosis(parsed);
-        diagnosis.modelUsed = model;
-
-        roomVisionCache.set(cacheKey, {
-          expiresAt: Date.now() + CACHE_TTL_MS,
-          diagnosis,
-        });
-
-        res.json(diagnosis);
-        return;
-      } catch (err) {
-        lastError = err;
-        if (isQuotaExhaustedError(err) && model === 'gemini-4-hydrogen') {
-          continue;
-        }
-        break;
-      }
-    }
-
-    if (isQuotaExhaustedError(lastError)) {
-      res.status(429).json({
-        error: 'QUOTA_EXCEEDED',
-        message:
-          'Gemini Vision quota reached. Upgrade or select a billing-enabled API key in Settings > Secrets, or retry shortly.',
+      roomVisionCache.set(cacheKey, {
+        expiresAt: Date.now() + CACHE_TTL_MS,
+        diagnosis,
       });
-      return;
-    }
 
-    const msg =
-      lastError instanceof Error ? lastError.message : 'Gemini Vision analysis failed.';
-    const status = /PERMISSION_DENIED|API_KEY_INVALID|403|400/i.test(msg) ? 403 : 502;
-    res.status(status).json({
-      error: 'VISION_AUDIT_FAILED',
-      message:
-        status === 403
-          ? 'Gemini API key permission issue. Please check Settings > Secrets.'
-          : 'Could not complete Gemini Vision room scan. Please tap Retry Scan.',
-    });
+      res.json(diagnosis);
+      return;
+    } catch (lastError) {
+      if (isQuotaExhaustedError(lastError)) {
+        res.status(429).json({
+          error: 'QUOTA_EXCEEDED',
+          message:
+            'Gemini Vision quota reached. Upgrade or select a billing-enabled API key in Settings > Secrets, or retry shortly.',
+        });
+        return;
+      }
+
+      const authIssue = isAuthOrKeyError(lastError);
+      const status = authIssue ? 403 : 503;
+      res.status(status).json({
+        error: 'VISION_AUDIT_FAILED',
+        message: authIssue
+          ? 'Gemini API key permission issue. Please check your GEMINI_API_KEY in Settings > Secrets.'
+          : 'Could not complete Gemini Vision room scan right now. Please tap Retry Scan.',
+      });
+    }
   });
 
   // 4. Live Pan-India Air Quality via Open-Meteo Air Quality API (No API key required)
@@ -1769,7 +1930,6 @@ async function startServer() {
       return;
     }
 
-    const ai = createGeminiClient(geminiKey);
     const personaName = getPersonaDisplayName(persona);
     const riskText =
       modifiers.length > 0
@@ -1794,100 +1954,95 @@ async function startServer() {
       `4. Always return concise asthmaTip and gasStoveTip tailored to ${city}'s live ${pm25} μg/m³ PM2.5 and ${no2} μg/m³ NO₂.`,
     ].join('\n');
 
-    let lastError: unknown = null;
-    for (const model of ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'] as const) {
-      try {
-        const response = await ai.models.generateContent({
-          model,
-          contents: prompt,
-          config: {
-            responseMimeType: 'application/json',
-            responseSchema: TODAY_ADVISORY_SCHEMA,
-            ...(model === 'gemini-4-hydrogen'
-              ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
-              : {}),
-          },
-        });
+    try {
+      const { result: payload } = await executeWithGeminiFallback(
+        'today-advisory',
+        async (ai, model) => {
+          const response = await ai.models.generateContent({
+            model,
+            contents: prompt,
+            config: {
+              responseMimeType: 'application/json',
+              responseSchema: TODAY_ADVISORY_SCHEMA,
+              ...(model === 'gemini-4-hydrogen'
+                ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+                : {}),
+            },
+          });
 
-        const jsonStr = (response.text || '').trim();
-        if (!jsonStr) throw new Error('Empty JSON from Gemini advisory.');
+          const jsonStr = cleanJsonResponseText(response.text || '');
+          if (!jsonStr) throw new Error('Empty JSON from Gemini advisory.');
 
-        const parsed = JSON.parse(jsonStr) as {
-          heroVerdict?: string;
-          asthmaTip?: string;
-          gasStoveTip?: string;
-          routines?: Array<{
-            period?: 'Morning' | 'Afternoon' | 'Evening';
-            title?: string;
-            impactPill?: string;
-            whyPill?: string;
-          }>;
-        };
+          const parsed = JSON.parse(jsonStr) as {
+            heroVerdict?: string;
+            asthmaTip?: string;
+            gasStoveTip?: string;
+            routines?: Array<{
+              period?: 'Morning' | 'Afternoon' | 'Evening';
+              title?: string;
+              impactPill?: string;
+              whyPill?: string;
+            }>;
+          };
 
-        const validPeriods = new Set(['Morning', 'Afternoon', 'Evening']);
-        const routines = (Array.isArray(parsed.routines) ? parsed.routines : [])
-          .slice(0, 6)
-          .map((item, idx) => ({
-            id: `gen-${persona}-${idx + 1}`,
-            period: (validPeriods.has(String(item.period))
-              ? item.period
-              : idx < 2
-                ? 'Morning'
-                : idx === 2
-                  ? 'Afternoon'
-                  : 'Evening') as 'Morning' | 'Afternoon' | 'Evening',
-            title: String(item.title || 'Monitor outdoor AQI before stepping out').trim(),
-            impactPill: String(item.impactPill || 'Lower PM2.5').trim(),
-            whyPill: String(item.whyPill || `Calibrated for ${aqi} AQI`).trim(),
-            completed: false,
-          }));
+          const validPeriods = new Set(['Morning', 'Afternoon', 'Evening']);
+          const routines = (Array.isArray(parsed.routines) ? parsed.routines : [])
+            .slice(0, 6)
+            .map((item, idx) => ({
+              id: `gen-${persona}-${idx + 1}`,
+              period: (validPeriods.has(String(item.period))
+                ? item.period
+                : idx < 2
+                  ? 'Morning'
+                  : idx === 2
+                    ? 'Afternoon'
+                    : 'Evening') as 'Morning' | 'Afternoon' | 'Evening',
+              title: String(item.title || 'Monitor outdoor AQI before stepping out').trim(),
+              impactPill: String(item.impactPill || 'Lower PM2.5').trim(),
+              whyPill: String(item.whyPill || `Calibrated for ${aqi} AQI`).trim(),
+              completed: false,
+            }));
 
-        if (!parsed.heroVerdict || routines.length === 0) {
-          throw new Error('Incomplete advisory structure returned by Gemini.');
+          if (!parsed.heroVerdict || routines.length === 0) {
+            throw new Error('Incomplete advisory structure returned by Gemini.');
+          }
+
+          return {
+            heroVerdict: String(parsed.heroVerdict).trim(),
+            asthmaTip: String(parsed.asthmaTip || 'Keep rescue inhaler ready outdoors').trim(),
+            gasStoveTip: String(parsed.gasStoveTip || 'Run kitchen chimney 5 mins early').trim(),
+            routines,
+            modelUsed: model,
+          };
         }
+      );
 
-        const payload: TodayAdvisoryCacheEntry['data'] = {
-          heroVerdict: String(parsed.heroVerdict).trim(),
-          asthmaTip: String(parsed.asthmaTip || 'Keep rescue inhaler ready outdoors').trim(),
-          gasStoveTip: String(parsed.gasStoveTip || 'Run kitchen chimney 5 mins early').trim(),
-          routines,
-          modelUsed: model,
-        };
-
-        todayAdvisoryCache.set(cacheKey, {
-          expiresAt: Date.now() + CACHE_TTL_MS,
-          data: payload,
-        });
-
-        res.json(payload);
-        return;
-      } catch (err) {
-        lastError = err;
-        if (isQuotaExhaustedError(err) && model === 'gemini-4-hydrogen') {
-          continue;
-        }
-        break;
-      }
-    }
-
-    if (isQuotaExhaustedError(lastError)) {
-      res.status(429).json({
-        error: 'QUOTA_EXCEEDED',
-        message:
-          'Gemini quota reached. Select a billing-enabled API key in Settings > Secrets, or retry shortly.',
+      todayAdvisoryCache.set(cacheKey, {
+        expiresAt: Date.now() + CACHE_TTL_MS,
+        data: payload,
       });
-      return;
-    }
 
-    const msg = lastError instanceof Error ? lastError.message : 'Gemini advisory failed.';
-    const status = /PERMISSION_DENIED|API_KEY_INVALID|403|400/i.test(msg) ? 403 : 502;
-    res.status(status).json({
-      error: 'ADVISORY_FAILED',
-      message:
-        status === 403
-          ? 'Gemini API key permission issue. Please check Settings > Secrets.'
-          : 'Could not generate Gemini personalized verdict right now.',
-    });
+      res.json(payload);
+      return;
+    } catch (lastError) {
+      if (isQuotaExhaustedError(lastError)) {
+        res.status(429).json({
+          error: 'QUOTA_EXCEEDED',
+          message:
+            'Gemini quota reached. Select a billing-enabled API key in Settings > Secrets, or retry shortly.',
+        });
+        return;
+      }
+
+      const authIssue = isAuthOrKeyError(lastError);
+      const status = authIssue ? 403 : 503;
+      res.status(status).json({
+        error: 'ADVISORY_FAILED',
+        message: authIssue
+          ? 'Gemini API key permission issue. Please check your GEMINI_API_KEY in Settings > Secrets.'
+          : 'Could not generate Gemini personalized verdict right now. Tap Retry Verdict.',
+      });
+    }
   });
 
   // 7. Live "Ask AeroPulse" Floating Copilot grounded in real-time Open-Meteo AQI
@@ -1948,11 +2103,8 @@ async function startServer() {
       .filter(Boolean)
       .join('\n');
 
-    const ai = createGeminiClient(geminiKey);
-    let lastError: unknown = null;
-
-    for (const model of ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'] as const) {
-      try {
+    try {
+      const { result } = await executeWithGeminiFallback('today-ask', async (ai, model) => {
         const response = await ai.models.generateContent({
           model,
           contents: question,
@@ -1966,7 +2118,7 @@ async function startServer() {
           },
         });
 
-        const jsonStr = (response.text || '').trim();
+        const jsonStr = cleanJsonResponseText(response.text || '');
         if (!jsonStr) throw new Error('Empty response from Gemini copilot.');
 
         const parsed = JSON.parse(jsonStr) as {
@@ -1975,40 +2127,35 @@ async function startServer() {
           impactTag?: string;
         };
 
-        res.json({
+        return {
           headline: String(parsed.headline || `${city} Air Guidance (${aqi} AQI)`).trim(),
           answer: String(parsed.answer || '').trim(),
           impactTag: String(parsed.impactTag || `Safe Window: ${bestWindow}`).trim(),
           modelUsed: model,
+        };
+      });
+
+      res.json(result);
+      return;
+    } catch (lastError) {
+      if (isQuotaExhaustedError(lastError)) {
+        res.status(429).json({
+          error: 'QUOTA_EXCEEDED',
+          message:
+            'Gemini quota reached. Upgrade or select a billing-enabled API key in Settings > Secrets, or retry shortly.',
         });
         return;
-      } catch (err) {
-        lastError = err;
-        if (isQuotaExhaustedError(err) && model === 'gemini-4-hydrogen') {
-          continue;
-        }
-        break;
       }
-    }
 
-    if (isQuotaExhaustedError(lastError)) {
-      res.status(429).json({
-        error: 'QUOTA_EXCEEDED',
-        message:
-          'Gemini quota reached. Upgrade or select a billing-enabled API key in Settings > Secrets, or retry shortly.',
-      });
-      return;
-    }
-
-    const msg = lastError instanceof Error ? lastError.message : 'Gemini copilot failed.';
-    const status = /PERMISSION_DENIED|API_KEY_INVALID|403|400/i.test(msg) ? 403 : 502;
-    res.status(status).json({
-      error: 'COPILOT_FAILED',
-      message:
-        status === 403
-          ? 'Gemini API key permission issue. Please check Settings > Secrets.'
+      const authIssue = isAuthOrKeyError(lastError);
+      const status = authIssue ? 403 : 503;
+      res.status(status).json({
+        error: 'COPILOT_FAILED',
+        message: authIssue
+          ? 'Gemini API key permission issue. Please check your GEMINI_API_KEY in Settings > Secrets.'
           : 'Could not reach AeroPulse Gemini copilot right now. Please try again.',
-    });
+      });
+    }
   });
 
   // 8. Global Multi-Turn "Ask AeroPulse" AI Copilot synced across Today, Room Audit, and Commute & Impact
@@ -2180,9 +2327,6 @@ async function startServer() {
       { role: 'user' as const, parts: [{ text: message }] },
     ];
 
-    const ai = createGeminiClient(geminiKey);
-    let lastError: unknown = null;
-
     // Helper to strip any accidental inline {"action":"OPEN_MAP",...} JSON tag from text fields
     const extractInlineMapAction = (
       text: string
@@ -2208,8 +2352,8 @@ async function startServer() {
       };
     };
 
-    for (const model of ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'] as const) {
-      try {
+    try {
+      const { result } = await executeWithGeminiFallback('copilot-chat', async (ai, model) => {
         const response = await ai.models.generateContent({
           model,
           contents,
@@ -2223,7 +2367,7 @@ async function startServer() {
           },
         });
 
-        const jsonStr = (response.text || '').trim();
+        const jsonStr = cleanJsonResponseText(response.text || '');
         if (!jsonStr) throw new Error('Empty JSON returned by Gemini copilot.');
 
         const parsed = JSON.parse(jsonStr) as {
@@ -2284,7 +2428,7 @@ async function startServer() {
           resolvedMapAction = whyChecked.found;
         }
 
-        res.json({
+        return {
           directAnswer: directChecked.cleaned || `${city} is at ${aqi} AQI (${severityLabel}).`,
           steps:
             steps.length > 0
@@ -2297,35 +2441,30 @@ async function startServer() {
           whyImpact: whyChecked.cleaned,
           mapAction: resolvedMapAction,
           modelUsed: model,
+        };
+      });
+
+      res.json(result);
+      return;
+    } catch (lastError) {
+      if (isQuotaExhaustedError(lastError)) {
+        res.status(429).json({
+          error: 'QUOTA_EXCEEDED',
+          message:
+            'Gemini quota reached. Select a billing-enabled API key in Settings > Secrets, or retry shortly.',
         });
         return;
-      } catch (err) {
-        lastError = err;
-        if (isQuotaExhaustedError(err) && model === 'gemini-4-hydrogen') {
-          continue;
-        }
-        break;
       }
-    }
 
-    if (isQuotaExhaustedError(lastError)) {
-      res.status(429).json({
-        error: 'QUOTA_EXCEEDED',
-        message:
-          'Gemini quota reached. Select a billing-enabled API key in Settings > Secrets, or retry shortly.',
+      const authIssue = isAuthOrKeyError(lastError);
+      const status = authIssue ? 403 : 503;
+      res.status(status).json({
+        error: 'COPILOT_CHAT_FAILED',
+        message: authIssue
+          ? 'Gemini API key permission issue. Please check your GEMINI_API_KEY in Settings > Secrets.'
+          : 'Gemini is temporarily busy due to high demand. Tap Retry.',
       });
-      return;
     }
-
-    const msg = lastError instanceof Error ? lastError.message : 'Gemini chat failed.';
-    const status = /PERMISSION_DENIED|API_KEY_INVALID|403|400/i.test(msg) ? 403 : 502;
-    res.status(status).json({
-      error: 'COPILOT_CHAT_FAILED',
-      message:
-        status === 403
-          ? 'Gemini API key permission issue. Please check Settings > Secrets.'
-          : 'Could not reach AeroPulse Gemini copilot right now. Tap Retry.',
-    });
   });
 
   // Guarantee unmatched /api/* routes and API errors always return JSON (never HTML)
