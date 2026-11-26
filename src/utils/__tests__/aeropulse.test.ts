@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { INITIAL_HABIT_SWAPS } from '../../data/mockCities';
+import { INITIAL_HABIT_SWAPS } from '../../data/indianCities';
 import {
   calculateCommuteImpact,
   calculateErrandBundleImpact,

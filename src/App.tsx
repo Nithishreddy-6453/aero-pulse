@@ -14,7 +14,7 @@ import {
   INDIAN_CITIES,
   INITIAL_HABIT_SWAPS,
   INITIAL_INDOOR_HACKS,
-} from './data/mockCities';
+} from './data/indianCities';
 import { fetchLiveAirQuality, reverseGeocodeIndianCoords } from './services/airQuality';
 import { clearAdvisoryCacheForCity, fetchTodayAdvisory } from './services/gemini';
 import {
@@ -814,6 +814,12 @@ export default function App() {
 
   return (
     <div className="relative min-h-screen text-[#0F172A]">
+      <a
+        href="#main-content"
+        className="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-[100] focus:rounded-xl focus:bg-white focus:px-4 focus:py-2 focus:text-sm focus:font-semibold focus:text-[#0F172A] focus:shadow-lg focus:outline-none focus:ring-2 focus:ring-[#007AFF]"
+      >
+        Skip to main content
+      </a>
       {/* Live GPU-Accelerated Apple Weather Ambient Atmospheric Canvas */}
       <div
         className="pointer-events-none fixed inset-0 z-0 overflow-hidden"
@@ -874,7 +880,11 @@ export default function App() {
       </AnimatePresence>
 
       {/* Main Content Container */}
-      <main className="relative z-10 mx-auto max-w-[1320px] px-4 pt-6 sm:px-6 lg:px-8">
+      <main
+        id="main-content"
+        tabIndex={-1}
+        className="relative z-10 mx-auto max-w-[1320px] px-4 pt-6 focus:outline-none sm:px-6 lg:px-8"
+      >
         <AnimatePresence mode="wait">
           <motion.div
             key={activeTab}

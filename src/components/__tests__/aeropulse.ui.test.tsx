@@ -9,7 +9,7 @@ import { SevereSmogBanner } from '../SevereSmogBanner';
 import { TabErrorBoundary } from '../TabErrorBoundary';
 import { TodayTab } from '../TodayTab';
 import { TopNavbar } from '../TopNavbar';
-import { INDIAN_CITIES, INITIAL_INDOOR_HACKS } from '../../data/mockCities';
+import { INDIAN_CITIES, INITIAL_INDOOR_HACKS } from '../../data/indianCities';
 import * as geminiService from '../../services/gemini';
 import {
   AeroTab,

@@ -12,7 +12,7 @@ import {
   Wind,
 } from 'lucide-react';
 import { motion } from 'motion/react';
-import { ROOM_AUDIT_PRESETS } from '../data/mockCities';
+import { ROOM_AUDIT_PRESETS } from '../data/indianCities';
 import { analyzeRoomPhotoWithGemini } from '../services/gemini';
 import {
   BudgetTier,
