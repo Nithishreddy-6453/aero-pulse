@@ -1,14 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CheckCircle2 } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
-import { CommuteImpactTab } from './components/CommuteImpactTab';
 import { FloatingCopilot } from './components/FloatingCopilot';
-import { RoomAuditTab } from './components/RoomAuditTab';
 import { SevereSmogBanner } from './components/SevereSmogBanner';
 import { TabErrorBoundary } from './components/TabErrorBoundary';
 import { TodayTab } from './components/TodayTab';
 import { TopNavbar } from './components/TopNavbar';
 import { WhatsAppAlertModal, WhatsAppLanguage } from './components/WhatsAppAlertModal';
+
 import {
   applyLiveAirQualityToCity,
   createDynamicIndianCity,
@@ -42,6 +41,43 @@ import {
   savePersistedState,
 } from './utils/storage';
 
+const RoomAuditTab = lazy(() =>
+  import('./components/RoomAuditTab').then((m) => ({ default: m.RoomAuditTab }))
+);
+const CommuteImpactTab = lazy(() =>
+  import('./components/CommuteImpactTab').then((m) => ({ default: m.CommuteImpactTab }))
+);
+
+function TabSkeletonFallback({ label }: { label: string }) {
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      aria-label={`Loading ${label}`}
+      className="space-y-6 pb-32"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex gap-2">
+          <div className="h-10 w-28 animate-pulse rounded-full bg-white/80 ring-1 ring-slate-200/70" />
+          <div className="h-10 w-24 animate-pulse rounded-full bg-white/80 ring-1 ring-slate-200/70" />
+          <div className="h-10 w-32 animate-pulse rounded-full bg-white/80 ring-1 ring-slate-200/70" />
+        </div>
+        <div className="h-9 w-40 animate-pulse rounded-full bg-white/80 ring-1 ring-slate-200/70" />
+      </div>
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
+        <div className="glass-card h-[420px] animate-pulse rounded-3xl p-6 lg:col-span-7">
+          <div className="h-full w-full rounded-2xl bg-slate-200/60" />
+        </div>
+        <div className="space-y-4 lg:col-span-5">
+          <div className="glass-card h-44 animate-pulse rounded-3xl p-6" />
+          <div className="glass-card h-28 animate-pulse rounded-3xl p-6" />
+          <div className="glass-card h-28 animate-pulse rounded-3xl p-6" />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 const PRESET_CITY_IDS = new Set(INDIAN_CITIES.map((c) => c.id));
 const DEFAULT_SELECTED_ERRANDS = ['Groceries', 'Pharmacy'];
 
@@ -58,18 +94,25 @@ const TAB_LABELS: Record<AeroTab, LiveAppContext['activeTab']> = {
   commute: 'Commute & Impact',
 };
 
-function getAtmosphericGradient(severity: CityAirProfile['severity'], isLive: boolean): string {
-  if (!isLive) {
-    return 'radial-gradient(ellipse 80% 45% at 50% -10%, rgba(0, 199, 190, 0.09), rgba(148, 163, 184, 0.05) 45%, rgba(248, 250, 252, 0) 80%)';
-  }
-  if (severity === 'severe' || severity === 'poor') {
-    return 'radial-gradient(ellipse 80% 45% at 50% -10%, rgba(255, 59, 48, 0.11), rgba(255, 149, 0, 0.05) 45%, rgba(248, 250, 252, 0) 80%)';
-  }
-  if (severity === 'moderate') {
-    return 'radial-gradient(ellipse 80% 45% at 50% -10%, rgba(255, 149, 0, 0.12), rgba(0, 199, 190, 0.05) 50%, rgba(248, 250, 252, 0) 80%)';
-  }
-  return 'radial-gradient(ellipse 80% 45% at 50% -10%, rgba(52, 199, 89, 0.13), rgba(0, 199, 190, 0.07) 50%, rgba(248, 250, 252, 0) 80%)';
+type AtmosphereTone = 'neutral' | 'good' | 'moderate' | 'poor';
+
+function getAtmosphereTone(aqi: number, isLive: boolean): AtmosphereTone {
+  if (!isLive) return 'neutral';
+  if (aqi <= 50) return 'good';
+  if (aqi <= 100) return 'moderate';
+  return 'poor';
 }
+
+const ATMOSPHERE_LAYERS: Record<AtmosphereTone, string> = {
+  neutral:
+    'radial-gradient(ellipse 90% 60% at 15% -5%, rgba(186, 230, 253, 0.42), transparent 62%), radial-gradient(ellipse 80% 55% at 88% 8%, rgba(203, 213, 225, 0.42), transparent 64%), linear-gradient(180deg, #EFF5FC 0%, #F7FAFD 52%, #F3F6FA 100%)',
+  good:
+    'radial-gradient(ellipse 90% 62% at 14% -8%, rgba(96, 185, 255, 0.42), transparent 62%), radial-gradient(ellipse 82% 55% at 88% 0%, rgba(165, 224, 255, 0.48), transparent 64%), radial-gradient(ellipse 75% 48% at 50% 98%, rgba(219, 242, 255, 0.56), transparent 70%), linear-gradient(180deg, #DCEFFE 0%, #EFF8FF 48%, #FBFEFF 100%)',
+  moderate:
+    'radial-gradient(ellipse 90% 62% at 14% -6%, rgba(245, 206, 138, 0.46), transparent 62%), radial-gradient(ellipse 82% 55% at 86% 4%, rgba(196, 209, 224, 0.48), transparent 64%), radial-gradient(ellipse 75% 48% at 52% 98%, rgba(238, 229, 210, 0.52), transparent 70%), linear-gradient(180deg, #F6E9D2 0%, #F6F3EC 48%, #EDF1F6 100%)',
+  poor:
+    'radial-gradient(ellipse 90% 62% at 16% -6%, rgba(208, 138, 118, 0.44), transparent 62%), radial-gradient(ellipse 82% 56% at 84% 6%, rgba(168, 182, 200, 0.48), transparent 64%), radial-gradient(ellipse 75% 50% at 48% 98%, rgba(218, 198, 191, 0.48), transparent 70%), linear-gradient(180deg, #EEDAD2 0%, #EFEAE7 48%, #E6EBF1 100%)',
+};
 
 function matchPresetCityId(detectedCity: string): string | null {
   const norm = detectedCity.toLowerCase();
@@ -767,14 +810,25 @@ export default function App() {
     };
   }, [activeTab, selectedCity, persona, modifiers, roomAuditSnapshot, commuteSnapshot, hacks, habits]);
 
+  const atmosphereTone = getAtmosphereTone(selectedCity.aqi, selectedCity.isLive);
+
   return (
-    <div className="relative min-h-screen bg-[#F8FAFC] text-[#0F172A]">
-      {/* Airy Atmospheric Top Gradient Wash */}
+    <div className="relative min-h-screen text-[#0F172A]">
+      {/* Live GPU-Accelerated Apple Weather Ambient Atmospheric Canvas */}
       <div
-        className="pointer-events-none fixed inset-x-0 top-0 z-0 h-[420px] transition-all duration-700"
-        style={{ background: getAtmosphericGradient(selectedCity.severity, selectedCity.isLive) }}
+        className="pointer-events-none fixed inset-0 z-0 overflow-hidden"
         aria-hidden="true"
-      />
+      >
+        {(Object.keys(ATMOSPHERE_LAYERS) as AtmosphereTone[]).map((tone) => (
+          <div
+            key={tone}
+            className={`absolute inset-0 transition-opacity duration-700 ease-out will-change-[opacity] ${
+              atmosphereTone === tone ? 'opacity-100' : 'opacity-0'
+            }`}
+            style={{ background: ATMOSPHERE_LAYERS[tone] }}
+          />
+        ))}
+      </div>
 
       {/* Sticky 3-Zone Frosted Top Navbar */}
       <TopNavbar
@@ -853,35 +907,39 @@ export default function App() {
 
             {activeTab === 'room-audit' && (
               <TabErrorBoundary sectionName="Room Audit">
-                <RoomAuditTab
-                  city={selectedCity}
-                  addedAuditFixKeys={addedRoutinePinIds}
-                  onToggleAddVisionFix={handleToggleAddVisionFix}
-                  onSnapshotChange={setRoomAuditSnapshot}
-                />
+                <Suspense fallback={<TabSkeletonFallback label="Room Audit" />}>
+                  <RoomAuditTab
+                    city={selectedCity}
+                    addedAuditFixKeys={addedRoutinePinIds}
+                    onToggleAddVisionFix={handleToggleAddVisionFix}
+                    onSnapshotChange={setRoomAuditSnapshot}
+                  />
+                </Suspense>
               </TabErrorBoundary>
             )}
 
             {activeTab === 'commute' && (
               <TabErrorBoundary sectionName="Commute & Impact">
-                <CommuteImpactTab
-                  city={selectedCity}
-                  habits={habits}
-                  onToggleHabit={handleToggleHabit}
-                  onChangeHabitDays={handleChangeHabitDays}
-                  onShowToast={showToast}
-                  onSnapshotChange={setCommuteSnapshot}
-                  externalRouteRequest={pendingMapRoute}
-                  onExternalRouteHandled={handleExternalRouteHandled}
-                  selectedErrands={selectedErrands}
-                  customErrands={customErrands}
-                  onToggleErrand={handleToggleErrand}
-                  onAddCustomErrand={handleAddCustomErrand}
-                  onRemoveCustomErrand={handleRemoveCustomErrand}
-                  whatsappLang={whatsappLang}
-                  onChangeWhatsappLang={setWhatsappLang}
-                  onOpenWhatsappModal={() => setIsWhatsappModalOpen(true)}
-                />
+                <Suspense fallback={<TabSkeletonFallback label="Commute & Impact" />}>
+                  <CommuteImpactTab
+                    city={selectedCity}
+                    habits={habits}
+                    onToggleHabit={handleToggleHabit}
+                    onChangeHabitDays={handleChangeHabitDays}
+                    onShowToast={showToast}
+                    onSnapshotChange={setCommuteSnapshot}
+                    externalRouteRequest={pendingMapRoute}
+                    onExternalRouteHandled={handleExternalRouteHandled}
+                    selectedErrands={selectedErrands}
+                    customErrands={customErrands}
+                    onToggleErrand={handleToggleErrand}
+                    onAddCustomErrand={handleAddCustomErrand}
+                    onRemoveCustomErrand={handleRemoveCustomErrand}
+                    whatsappLang={whatsappLang}
+                    onChangeWhatsappLang={setWhatsappLang}
+                    onOpenWhatsappModal={() => setIsWhatsappModalOpen(true)}
+                  />
+                </Suspense>
               </TabErrorBoundary>
             )}
           </motion.div>

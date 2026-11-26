@@ -10,7 +10,9 @@ import {
   Map,
   RefreshCw,
   Sparkles,
+  Square,
   UserRound,
+  Volume2,
   Wind,
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
@@ -58,6 +60,22 @@ const HACK_FILTERS: { id: BudgetTier; label: string }[] = [
   { id: 'smart', label: 'Smart' },
 ];
 
+type RoutinePeriod = 'Morning' | 'Afternoon' | 'Evening';
+
+function getActiveRoutinePeriod(hour24: number): RoutinePeriod {
+  if (hour24 < 12) return 'Morning';
+  if (hour24 < 17) return 'Afternoon';
+  return 'Evening';
+}
+
+function getHumanAirTranslation(pm25: number): { text: string; isClean: boolean } {
+  if (Number.isFinite(pm25) && pm25 > 22) {
+    const cigs = (pm25 / 22).toFixed(1);
+    return { text: `≈ ${cigs} cigarettes/day`, isClean: false };
+  }
+  return { text: 'Crisp, breathable air', isClean: true };
+}
+
 function getSeverityStyles(severity: CityAirProfile['severity'], isLive: boolean) {
   if (!isLive) {
     return {
@@ -70,20 +88,20 @@ function getSeverityStyles(severity: CityAirProfile['severity'], isLive: boolean
     return {
       pill: 'bg-[#FF3B30]/12 text-[#C81E1E] ring-1 ring-[#FF3B30]/25',
       numberAccent: 'text-[#C81E1E]',
-      glow: 'from-[#FF3B30]/10 via-white/40 to-transparent',
+      glow: 'from-[#D49886]/16 via-white/40 to-transparent',
     };
   }
   if (severity === 'moderate') {
     return {
       pill: 'bg-[#FF9500]/14 text-[#B45309] ring-1 ring-[#FF9500]/30',
       numberAccent: 'text-[#B45309]',
-      glow: 'from-[#FF9500]/10 via-white/40 to-transparent',
+      glow: 'from-[#F7DCA5]/20 via-white/40 to-transparent',
     };
   }
   return {
     pill: 'bg-[#34C759]/14 text-[#15803D] ring-1 ring-[#34C759]/30',
     numberAccent: 'text-[#15803D]',
-    glow: 'from-[#34C759]/10 via-white/40 to-transparent',
+    glow: 'from-[#93C5FD]/18 via-white/40 to-transparent',
   };
 }
 
@@ -107,13 +125,44 @@ export function TodayTab({
   const [hackFilter, setHackFilter] = useState<BudgetTier>('all');
   const [showHeatmap, setShowHeatmap] = useState<boolean>(false);
   const [hoveredSlotIdx, setHoveredSlotIdx] = useState<number | null>(null);
+  const [isSpeakingVerdict, setIsSpeakingVerdict] = useState<boolean>(false);
+  const [currentPeriod, setCurrentPeriod] = useState<RoutinePeriod>(() =>
+    getActiveRoutinePeriod(new Date().getHours())
+  );
 
-  // Reset hovered timeline slot whenever city changes
+  // Keep active routine time slot aligned with the user's local clock
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      setCurrentPeriod(getActiveRoutinePeriod(new Date().getHours()));
+    }, 60_000);
+    return () => window.clearInterval(interval);
+  }, []);
+
+  const supportsSpeechSynthesis =
+    typeof window !== 'undefined' &&
+    'speechSynthesis' in window &&
+    typeof SpeechSynthesisUtterance !== 'undefined';
+
+  // Reset hovered timeline slot & cancel any active speech when city or persona changes
   useEffect(() => {
     setHoveredSlotIdx(null);
-  }, [city.id]);
+    if (supportsSpeechSynthesis) {
+      window.speechSynthesis.cancel();
+    }
+    setIsSpeakingVerdict(false);
+  }, [city.id, persona, supportsSpeechSynthesis]);
+
+  // Ensure speech stops cleanly on unmount
+  useEffect(() => {
+    return () => {
+      if (supportsSpeechSynthesis) {
+        window.speechSynthesis.cancel();
+      }
+    };
+  }, [supportsSpeechSynthesis]);
 
   const sev = getSeverityStyles(city.severity, city.isLive);
+  const humanAirTranslation = useMemo(() => getHumanAirTranslation(city.pm25), [city.pm25]);
   const hasAsthma = modifiers.includes('asthma');
   const hasGasStove = modifiers.includes('gasStove');
 
@@ -142,6 +191,38 @@ export function TodayTab({
     hasTimeline && hoveredSlotIdx !== null
       ? ((hoveredSlotIdx + 0.5) / timeline.length) * 100
       : safeMidPct;
+
+  const handleToggleSpeakVerdict = () => {
+    if (!supportsSpeechSynthesis || !city.isLive) return;
+    if (isSpeakingVerdict) {
+      window.speechSynthesis.cancel();
+      setIsSpeakingVerdict(false);
+      return;
+    }
+
+    const verdictLine =
+      advisory?.heroVerdict ?? `Safe outdoor window is ${city.safeWindowLabel} in ${city.name}.`;
+    const topPrecaution =
+      (hasAsthma && advisory?.asthmaTip) ||
+      (hasGasStove && advisory?.gasStoveTip) ||
+      visibleRoutines[0]?.title ||
+      `Best outdoor window is ${city.safeWindowLabel}.`;
+
+    const spokenText = `${city.name} air quality is ${city.aqi} US AQI, ${city.severityLabel.toLowerCase()}. ${verdictLine}. Top precaution: ${topPrecaution}.`;
+
+    try {
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(spokenText);
+      utterance.lang = 'en-IN';
+      utterance.rate = 0.96;
+      utterance.onend = () => setIsSpeakingVerdict(false);
+      utterance.onerror = () => setIsSpeakingVerdict(false);
+      setIsSpeakingVerdict(true);
+      window.speechSynthesis.speak(utterance);
+    } catch {
+      setIsSpeakingVerdict(false);
+    }
+  };
 
   return (
     <div className="space-y-6 pb-32">
@@ -270,6 +351,23 @@ export function TodayTab({
                 </span>
 
                 {city.isLive && (
+                  <span
+                    title={
+                      humanAirTranslation.isClean
+                        ? 'Live PM2.5 is within crisp, clean breathing levels'
+                        : 'Berkeley Earth rule of thumb: 22 μg/m³ PM2.5 ≈ 1 cigarette/day'
+                    }
+                    className={`inline-flex items-center rounded-full px-3 py-1.5 text-[12px] font-semibold tabular-nums-strict ring-1 ${
+                      humanAirTranslation.isClean
+                        ? 'bg-sky-50/90 text-[#0369A1] ring-sky-200/75'
+                        : 'bg-stone-100/90 text-[#57534E] ring-stone-200/85'
+                    }`}
+                  >
+                    {humanAirTranslation.text}
+                  </span>
+                )}
+
+                {city.isLive && (
                   <span className="inline-flex items-center gap-1.5 rounded-full bg-[#00C7BE]/12 px-3 py-1.5 text-[12px] font-semibold text-[#0F766E] ring-1 ring-[#00C7BE]/25">
                     <Wind className="h-3.5 w-3.5" aria-hidden="true" />
                     Est. Indoor CO₂:{' '}
@@ -337,13 +435,45 @@ export function TodayTab({
 
             {/* Right: Bold 1-Line Context-Aware Gemini Verdict */}
             <div className="lg:max-w-md lg:text-right">
-              <div className="inline-flex items-center gap-1.5 text-[12px] font-semibold text-[#64748B]">
-                {isLoadingAdvisory ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin text-[#00C7BE]" aria-hidden="true" />
-                ) : (
-                  <Sparkles className="h-3.5 w-3.5 text-[#34C759]" aria-hidden="true" />
+              <div className="flex flex-wrap items-center gap-2 lg:justify-end">
+                <div className="inline-flex items-center gap-1.5 text-[12px] font-semibold text-[#64748B]">
+                  {isLoadingAdvisory ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin text-[#00C7BE]" aria-hidden="true" />
+                  ) : (
+                    <Sparkles className="h-3.5 w-3.5 text-[#34C759]" aria-hidden="true" />
+                  )}
+                  {isLoadingAdvisory ? 'Personalizing with Gemini...' : 'AeroPulse Verdict'}
+                </div>
+
+                {supportsSpeechSynthesis && city.isLive && !isLoadingAdvisory && (
+                  <button
+                    type="button"
+                    onClick={handleToggleSpeakVerdict}
+                    aria-pressed={isSpeakingVerdict}
+                    aria-label={
+                      isSpeakingVerdict
+                        ? 'Stop reading today air quality verdict'
+                        : 'Listen to today air quality verdict and top precaution'
+                    }
+                    className={`apple-press inline-flex h-7 items-center gap-1.5 rounded-full px-2.5 text-[11.5px] font-bold transition-colors backdrop-blur-md ${
+                      isSpeakingVerdict
+                        ? 'bg-[#FF3B30]/12 text-[#C81E1E] ring-1 ring-[#FF3B30]/30'
+                        : 'bg-white/85 text-[#0F172A] ring-1 ring-slate-200/90 hover:bg-white'
+                    }`}
+                  >
+                    {isSpeakingVerdict ? (
+                      <>
+                        <Square className="h-2.5 w-2.5 fill-current" aria-hidden="true" />
+                        <span>Stop</span>
+                      </>
+                    ) : (
+                      <>
+                        <Volume2 className="h-3.5 w-3.5 text-[#0F766E]" aria-hidden="true" />
+                        <span>Listen</span>
+                      </>
+                    )}
+                  </button>
                 )}
-                {isLoadingAdvisory ? 'Personalizing with Gemini...' : 'AeroPulse Verdict'}
               </div>
 
               {isLoadingAdvisory && !advisory ? (
@@ -562,10 +692,30 @@ export function TodayTab({
               {(['Morning', 'Afternoon', 'Evening'] as const).map((period) => {
                 const group = visibleRoutines.filter((r) => r.period === period);
                 if (group.length === 0) return null;
+                const isNowPeriod = period === currentPeriod;
                 return (
-                  <div key={period} className="space-y-2">
-                    <div className="text-[11px] font-bold uppercase tracking-[0.06em] text-[#64748B]">
-                      {period}
+                  <div
+                    key={period}
+                    className={`space-y-2 transition-all duration-200 ${
+                      isNowPeriod
+                        ? 'rounded-2xl bg-white/75 p-3 ring-1 ring-slate-200/85 shadow-[0_10px_28px_-14px_rgba(15,23,42,0.16)]'
+                        : 'opacity-70 hover:opacity-100'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div
+                        className={`text-[11px] font-bold uppercase tracking-[0.06em] ${
+                          isNowPeriod ? 'text-[#0F172A]' : 'text-[#64748B]'
+                        }`}
+                      >
+                        {period}
+                      </div>
+                      {isNowPeriod && (
+                        <span className="inline-flex items-center gap-1.5 rounded-full bg-[#34C759]/14 px-2.5 py-0.5 text-[10px] font-extrabold uppercase tracking-[0.06em] text-[#15803D] ring-1 ring-[#34C759]/25">
+                          <span className="h-1.5 w-1.5 rounded-full bg-[#34C759]" aria-hidden="true" />
+                          NOW
+                        </span>
+                      )}
                     </div>
                     <div className="space-y-2">
                       {group.map((item) => (
@@ -575,7 +725,9 @@ export function TodayTab({
                           className={`apple-press flex cursor-pointer items-center justify-between gap-3 rounded-2xl border px-4 py-3 transition-colors ${
                             item.completed
                               ? 'border-slate-200/70 bg-slate-50/75'
-                              : 'border-slate-200/80 bg-white/90 hover:border-slate-300'
+                              : isNowPeriod
+                                ? 'border-slate-200/90 bg-white shadow-2xs hover:border-slate-300'
+                                : 'border-slate-200/80 bg-white/90 hover:border-slate-300'
                           }`}
                         >
                           <div className="flex min-w-0 items-center gap-3">

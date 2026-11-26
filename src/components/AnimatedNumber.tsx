@@ -23,6 +23,7 @@ export function AnimatedNumber({
   useEffect(() => {
     const prefersReduced =
       typeof window !== 'undefined' &&
+      typeof window.matchMedia === 'function' &&
       window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
     if (prefersReduced) {

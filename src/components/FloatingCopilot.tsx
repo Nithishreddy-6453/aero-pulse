@@ -6,8 +6,10 @@ import {
   ChevronDown,
   MapPin,
   MessageSquare,
+  Mic,
   RefreshCw,
   Sparkles,
+  Square,
   Trash2,
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
@@ -29,6 +31,51 @@ interface FloatingCopilotProps {
   personaLabel: string;
   getLiveAppContext: () => LiveAppContext;
   onOpenMapRoute: (origin: string, destination: string) => void;
+}
+
+interface SpeechRecognitionAlternativeLike {
+  transcript: string;
+}
+
+interface SpeechRecognitionResultLike {
+  readonly isFinal: boolean;
+  readonly length: number;
+  [index: number]: SpeechRecognitionAlternativeLike;
+}
+
+interface SpeechRecognitionResultListLike {
+  readonly length: number;
+  [index: number]: SpeechRecognitionResultLike;
+}
+
+interface SpeechRecognitionEventLike {
+  readonly resultIndex: number;
+  readonly results: SpeechRecognitionResultListLike;
+}
+
+interface SpeechRecognitionInstance {
+  lang: string;
+  interimResults: boolean;
+  continuous: boolean;
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
+  onerror: (() => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+  abort: () => void;
+}
+
+type SpeechRecognitionCtor = new () => SpeechRecognitionInstance;
+
+interface WindowWithSpeechRecognition extends Window {
+  SpeechRecognition?: SpeechRecognitionCtor;
+  webkitSpeechRecognition?: SpeechRecognitionCtor;
+}
+
+function getSpeechRecognitionCtor(): SpeechRecognitionCtor | null {
+  if (typeof window === 'undefined') return null;
+  const win = window as WindowWithSpeechRecognition;
+  return win.SpeechRecognition ?? win.webkitSpeechRecognition ?? null;
 }
 
 const TAB_STARTER_CHIPS: Record<AeroTab, string[]> = {
@@ -102,9 +149,86 @@ export function FloatingCopilot({
   const [isResponding, setIsResponding] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
   const [lastFailedPrompt, setLastFailedPrompt] = useState<string | null>(null);
+  const [isListening, setIsListening] = useState(false);
 
   const scrollViewportRef = useRef<HTMLDivElement | null>(null);
   const prevContextSigRef = useRef<{ cityId: string; persona: PersonaId } | null>(null);
+  const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
+
+  const isVoiceSupported = getSpeechRecognitionCtor() !== null;
+
+  // Clean up speech recognition if component unmounts
+  useEffect(() => {
+    return () => {
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.abort();
+        } catch {
+          // ignore cleanup errors
+        }
+        recognitionRef.current = null;
+      }
+    };
+  }, []);
+
+  const stopVoiceInput = () => {
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch {
+        // ignore already stopped
+      }
+      recognitionRef.current = null;
+    }
+    setIsListening(false);
+  };
+
+  const toggleVoiceInput = () => {
+    if (isListening) {
+      stopVoiceInput();
+      return;
+    }
+    const Ctor = getSpeechRecognitionCtor();
+    if (!Ctor) return;
+
+    try {
+      const recognition = new Ctor();
+      recognition.lang = 'en-IN';
+      recognition.interimResults = true;
+      recognition.continuous = false;
+
+      recognition.onresult = (event: SpeechRecognitionEventLike) => {
+        let transcript = '';
+        for (let i = 0; i < event.results.length; i++) {
+          const item = event.results[i];
+          if (item && item[0]?.transcript) {
+            transcript += item[0].transcript;
+          }
+        }
+        const cleaned = sanitizeUserInput(transcript, 400);
+        if (cleaned) {
+          setInput(cleaned);
+        }
+      };
+
+      recognition.onerror = () => {
+        setIsListening(false);
+        recognitionRef.current = null;
+      };
+
+      recognition.onend = () => {
+        setIsListening(false);
+        recognitionRef.current = null;
+      };
+
+      recognitionRef.current = recognition;
+      setIsListening(true);
+      recognition.start();
+    } catch {
+      setIsListening(false);
+      recognitionRef.current = null;
+    }
+  };
 
   // Close drawer smoothly on Escape key
   useEffect(() => {
@@ -260,6 +384,7 @@ export function FloatingCopilot({
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
+    if (isListening) stopVoiceInput();
     void sendMessage(input);
   };
 
@@ -520,7 +645,13 @@ export function FloatingCopilot({
 
           {/* Frosted Chat Input */}
           <form onSubmit={handleSubmit} className="flex items-center gap-2">
-            <div className="flex h-10 flex-1 items-center gap-2.5 rounded-2xl bg-slate-100/85 px-3.5 ring-1 ring-slate-200/70 focus-within:bg-white focus-within:ring-[#34C759]">
+            <div
+              className={`flex h-10 flex-1 items-center gap-2 rounded-2xl bg-slate-100/85 pl-3.5 pr-1.5 ring-1 transition-colors focus-within:bg-white ${
+                isListening
+                  ? 'ring-[#FF3B30]/60 bg-rose-50/40'
+                  : 'ring-slate-200/70 focus-within:ring-[#34C759]'
+              }`}
+            >
               <Sparkles className="h-4 w-4 shrink-0 text-[#00C7BE]" aria-hidden="true" />
               <input
                 type="text"
@@ -530,9 +661,40 @@ export function FloatingCopilot({
                   if (messages.length > 0) setIsExpanded(true);
                 }}
                 disabled={isResponding}
-                placeholder={getTabPlaceholder(activeTab, city.name)}
+                placeholder={
+                  isListening
+                    ? 'Listening… speak your question clearly'
+                    : getTabPlaceholder(activeTab, city.name)
+                }
                 className="w-full bg-transparent text-[13px] font-medium text-[#0F172A] placeholder:text-[#64748B] focus:outline-none disabled:opacity-60"
               />
+              {isVoiceSupported && (
+                <button
+                  type="button"
+                  onClick={toggleVoiceInput}
+                  disabled={isResponding}
+                  aria-pressed={isListening}
+                  aria-label={isListening ? 'Stop voice input' : 'Speak question to AeroPulse'}
+                  title={isListening ? 'Stop listening' : 'Speak your question'}
+                  className={`apple-press relative inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full transition-colors disabled:opacity-45 ${
+                    isListening
+                      ? 'bg-[#FF3B30] text-white shadow-[0_0_0_3px_rgba(255,59,48,0.22)]'
+                      : 'text-[#475569] hover:bg-slate-200/80 hover:text-[#0F172A]'
+                  }`}
+                >
+                  {isListening && (
+                    <span
+                      className="animate-ar-pulse pointer-events-none absolute inset-0 rounded-full bg-[#FF3B30]"
+                      aria-hidden="true"
+                    />
+                  )}
+                  {isListening ? (
+                    <Square className="relative z-10 h-2.5 w-2.5 fill-current" aria-hidden="true" />
+                  ) : (
+                    <Mic className="relative z-10 h-3.5 w-3.5" aria-hidden="true" />
+                  )}
+                </button>
+              )}
             </div>
             <button
               type="submit"

@@ -14,6 +14,24 @@ const ROOM_VISION_CACHE_TTL_MS = 10 * 60 * 1000;
 const advisoryMemoryCache = new Map<string, { expiresAt: number; data: TodayAdvisoryPayload }>();
 const roomVisionMemoryCache = new Map<string, { expiresAt: number; data: RoomVisionDiagnosis }>();
 
+async function safeParseJson<T>(res: Response): Promise<T | null> {
+  const contentType = res.headers.get('content-type') || '';
+  const text = await res.text();
+  const trimmed = text.trim();
+  if (
+    !trimmed ||
+    trimmed.startsWith('<') ||
+    (!contentType.includes('json') && !trimmed.startsWith('{') && !trimmed.startsWith('['))
+  ) {
+    return null;
+  }
+  try {
+    return JSON.parse(trimmed) as T;
+  } catch {
+    return null;
+  }
+}
+
 export interface FetchTodayAdvisoryParams {
   cityId: string;
   city: string;
@@ -71,7 +89,10 @@ export async function fetchTodayAdvisory(
     }),
   });
 
-  const data = (await res.json()) as Partial<TodayAdvisoryPayload> & { message?: string };
+  const data = await safeParseJson<Partial<TodayAdvisoryPayload> & { message?: string }>(res);
+  if (!data) {
+    throw new Error('AeroPulse server is restarting or busy. Tap Retry Verdict.');
+  }
   if (!res.ok || !data.heroVerdict || !Array.isArray(data.routines)) {
     throw new Error(data.message || 'Could not generate Gemini personalized routine right now.');
   }
@@ -130,7 +151,10 @@ export async function analyzeRoomPhotoWithGemini(
     }),
   });
 
-  const data = (await res.json()) as RoomVisionDiagnosis & { message?: string };
+  const data = await safeParseJson<RoomVisionDiagnosis & { message?: string }>(res);
+  if (!data) {
+    throw new Error('Room Vision service is reconnecting. Please tap Retry Vision Scan.');
+  }
   if (!res.ok || !Array.isArray(data.traps)) {
     throw new Error(data.message || 'Could not complete Gemini Vision room scan. Tap Retry Scan.');
   }
@@ -166,7 +190,10 @@ export async function sendCopilotChatMessage(
     }),
   });
 
-  const data = (await res.json()) as Partial<CopilotChatReply> & { message?: string };
+  const data = await safeParseJson<Partial<CopilotChatReply> & { message?: string }>(res);
+  if (!data) {
+    throw new Error('AeroPulse Copilot is reconnecting. Please tap Retry.');
+  }
   if (!res.ok || !data.directAnswer) {
     throw new Error(data.message || 'Could not reach AeroPulse Gemini copilot right now.');
   }

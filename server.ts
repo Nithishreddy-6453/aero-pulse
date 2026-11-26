@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import crypto from 'crypto';
-import express, { Request, Response } from 'express';
+import express from 'express';
+import type { NextFunction, Request, Response } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
@@ -43,6 +44,56 @@ function sanitizeServerInput(raw: unknown, maxLength = 240): string {
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, maxLength);
+}
+
+const MAX_ROOM_IMAGE_BYTES = 5 * 1024 * 1024; // 5MB strict binary cap
+const ALLOWED_ROOM_IMAGE_MIMES = new Set(['image/jpeg', 'image/png', 'image/webp']);
+
+const GEMINI_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const GEMINI_RATE_LIMIT_MAX_REQUESTS = 20;
+const geminiRateBucket = new Map<string, number[]>();
+
+function getClientIp(req: Request): string {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string' && forwarded.trim()) {
+    return forwarded.split(',')[0].trim();
+  }
+  if (Array.isArray(forwarded) && forwarded[0]) {
+    return forwarded[0].trim();
+  }
+  return req.ip || req.socket.remoteAddress || 'unknown';
+}
+
+function geminiRateLimiter(req: Request, res: Response, next: NextFunction): void {
+  const now = Date.now();
+  const windowStart = now - GEMINI_RATE_LIMIT_WINDOW_MS;
+  const clientIp = getClientIp(req);
+
+  const timestamps = (geminiRateBucket.get(clientIp) ?? []).filter((ts) => ts > windowStart);
+  if (timestamps.length >= GEMINI_RATE_LIMIT_MAX_REQUESTS) {
+    const oldest = timestamps[0] ?? now;
+    const retryAfterSec = Math.max(1, Math.ceil((oldest + GEMINI_RATE_LIMIT_WINDOW_MS - now) / 1000));
+    res.setHeader('Retry-After', String(retryAfterSec));
+    res.status(429).json({
+      error: 'RATE_LIMITED',
+      message: `Rate limit reached (${GEMINI_RATE_LIMIT_MAX_REQUESTS} AI requests/min). Please retry in ${retryAfterSec}s.`,
+    });
+    return;
+  }
+
+  timestamps.push(now);
+  geminiRateBucket.set(clientIp, timestamps);
+
+  // Periodically prune stale IP keys so in-memory map stays bounded
+  if (geminiRateBucket.size > 500) {
+    for (const [ip, hits] of geminiRateBucket.entries()) {
+      if (hits.every((ts) => ts <= windowStart)) {
+        geminiRateBucket.delete(ip);
+      }
+    }
+  }
+
+  next();
 }
 
 interface LatLngPoint {
@@ -877,7 +928,44 @@ function getPersonaDisplayName(persona: string): string {
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '6mb' }));
+  app.disable('x-powered-by');
+
+  // Security headers across server responses (X-Frame-Options: DENY enforced on /api/* to protect endpoints without blocking preview iframe hosting)
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    if (req.path.startsWith('/api/')) {
+      res.setHeader('X-Frame-Options', 'DENY');
+    }
+    next();
+  });
+
+  // Enforce strict 5MB JSON payload cap on API bodies
+  app.use(express.json({ limit: '5mb' }));
+
+  // Graceful JSON response when a payload exceeds 5MB
+  app.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+    if (
+      err &&
+      typeof err === 'object' &&
+      'type' in err &&
+      (err as { type?: string }).type === 'entity.too.large'
+    ) {
+      res.status(413).json({
+        error: 'PAYLOAD_TOO_LARGE',
+        message: 'Upload exceeds the 5MB security limit. Please choose a smaller room photo.',
+      });
+      return;
+    }
+    next(err);
+  });
+
+  // Apply 20 req/min per-IP rate limiting on all Gemini-backed API endpoints
+  app.use('/api/today/advisory', geminiRateLimiter);
+  app.use('/api/today/ask', geminiRateLimiter);
+  app.use('/api/room-audit/analyze', geminiRateLimiter);
+  app.use('/api/copilot/chat', geminiRateLimiter);
+  app.use('/api/commute/analyze', geminiRateLimiter);
 
   // 1. Reverse Geocoding via OpenStreetMap Nominatim (Zero API key or billing required)
   app.post('/api/maps/reverse-geocode', async (req: Request, res: Response) => {
@@ -1267,18 +1355,35 @@ async function startServer() {
     }
 
     const imageBase64 = String(req.body?.imageBase64 || '').trim();
-    const mimeType = String(req.body?.mimeType || 'image/jpeg').trim();
-    const cityName = String(req.body?.city || 'New Delhi').trim();
+    const mimeType = String(req.body?.mimeType || '').trim().toLowerCase();
+    const cityName = sanitizeServerInput(req.body?.city, 80) || 'New Delhi';
     const aqi = Math.max(10, Number(req.body?.aqi) || 250);
-    const roomType = String(req.body?.roomType || 'Living Room').trim();
+    const roomType = sanitizeServerInput(req.body?.roomType, 60) || 'Living Room';
     const riskChips = Array.isArray(req.body?.riskChips)
-      ? req.body.riskChips.map((c: unknown) => String(c)).filter(Boolean)
+      ? req.body.riskChips.map((c: unknown) => sanitizeServerInput(c, 40)).filter(Boolean)
       : [];
 
     if (!imageBase64) {
       res.status(400).json({
         error: 'IMAGE_REQUIRED',
         message: 'A compressed room photo is required for Gemini Vision analysis.',
+      });
+      return;
+    }
+
+    if (!ALLOWED_ROOM_IMAGE_MIMES.has(mimeType)) {
+      res.status(400).json({
+        error: 'UNSUPPORTED_MEDIA_TYPE',
+        message: 'Unsupported image format. Please upload a JPEG, PNG, or WebP room photo.',
+      });
+      return;
+    }
+
+    const decodedImageBytes = Buffer.byteLength(imageBase64, 'base64');
+    if (decodedImageBytes > MAX_ROOM_IMAGE_BYTES) {
+      res.status(413).json({
+        error: 'PAYLOAD_TOO_LARGE',
+        message: 'Room image exceeds the 5MB maximum size limit.',
       });
       return;
     }
@@ -2222,6 +2327,37 @@ async function startServer() {
           : 'Could not reach AeroPulse Gemini copilot right now. Tap Retry.',
     });
   });
+
+  // Guarantee unmatched /api/* routes and API errors always return JSON (never HTML)
+  app.all('/api/*', (_req: Request, res: Response) => {
+    res.status(404).json({
+      error: 'API_NOT_FOUND',
+      message: 'Requested AeroPulse API endpoint was not found.',
+    });
+  });
+
+  app.use(
+    '/api',
+    (err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+      const status =
+        typeof err === 'object' &&
+        err !== null &&
+        'status' in err &&
+        typeof (err as { status?: unknown }).status === 'number'
+          ? (err as { status: number }).status
+          : 500;
+      const message =
+        err instanceof Error && err.message
+          ? err.message
+          : 'Unexpected AeroPulse API error. Please retry.';
+      if (!res.headersSent) {
+        res.status(status >= 400 && status < 600 ? status : 500).json({
+          error: 'API_ERROR',
+          message,
+        });
+      }
+    }
+  );
 
   // Mount Vite dev middleware in dev, or serve static dist in production
   if (process.env.NODE_ENV !== 'production') {

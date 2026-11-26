@@ -207,7 +207,12 @@ export function CommuteImpactTab({
           setSuggestions([]);
           return;
         }
-        const data = (await res.json()) as { suggestions?: PhotonSuggestion[] };
+        const rawText = await res.text();
+        if (!rawText || rawText.trimStart().startsWith('<')) {
+          setSuggestions([]);
+          return;
+        }
+        const data = JSON.parse(rawText) as { suggestions?: PhotonSuggestion[] };
         setSuggestions(Array.isArray(data.suggestions) ? data.suggestions : []);
       } catch {
         if (!controller.signal.aborted) {
@@ -263,10 +268,22 @@ export function CommuteImpactTab({
 
         if (reqId !== requestCounterRef.current) return;
 
-        const data = (await res.json()) as CommuteAnalysisResult & {
-          error?: string;
-          message?: string;
-        };
+        const rawText = await res.text();
+        if (!rawText || rawText.trimStart().startsWith('<')) {
+          setRouteError('Route service is restarting or temporarily unavailable. Please tap Retry.');
+          return;
+        }
+
+        let data: (CommuteAnalysisResult & { error?: string; message?: string }) | null = null;
+        try {
+          data = JSON.parse(rawText) as CommuteAnalysisResult & {
+            error?: string;
+            message?: string;
+          };
+        } catch {
+          setRouteError('Received an unexpected response from the routing service. Please retry.');
+          return;
+        }
 
         if (!res.ok) {
           setRouteError(data.message || 'Unable to plot route between those locations.');
