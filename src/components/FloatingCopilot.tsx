@@ -53,12 +53,18 @@ interface SpeechRecognitionEventLike {
   readonly results: SpeechRecognitionResultListLike;
 }
 
+interface SpeechRecognitionErrorEventLike {
+  readonly error?: string;
+  readonly message?: string;
+}
+
 interface SpeechRecognitionInstance {
   lang: string;
   interimResults: boolean;
   continuous: boolean;
+  onstart: (() => void) | null;
   onresult: ((event: SpeechRecognitionEventLike) => void) | null;
-  onerror: (() => void) | null;
+  onerror: ((event: SpeechRecognitionErrorEventLike) => void) | null;
   onend: (() => void) | null;
   start: () => void;
   stop: () => void;
@@ -150,54 +156,83 @@ export function FloatingCopilot({
   const [chatError, setChatError] = useState<string | null>(null);
   const [lastFailedPrompt, setLastFailedPrompt] = useState<string | null>(null);
   const [isListening, setIsListening] = useState(false);
+  const [voiceStatus, setVoiceStatus] = useState<string | null>(null);
 
   const scrollViewportRef = useRef<HTMLDivElement | null>(null);
   const prevContextSigRef = useRef<{ cityId: string; persona: PersonaId } | null>(null);
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
+  const isListeningIntentRef = useRef<boolean>(false);
 
   const isVoiceSupported = getSpeechRecognitionCtor() !== null;
 
   // Clean up speech recognition if component unmounts
   useEffect(() => {
     return () => {
-      if (recognitionRef.current) {
+      isListeningIntentRef.current = false;
+      const active = recognitionRef.current;
+      recognitionRef.current = null;
+      if (active) {
         try {
-          recognitionRef.current.abort();
+          active.abort();
         } catch {
           // ignore cleanup errors
         }
-        recognitionRef.current = null;
       }
     };
   }, []);
 
   const stopVoiceInput = () => {
-    if (recognitionRef.current) {
+    isListeningIntentRef.current = false;
+    setIsListening(false);
+    const active = recognitionRef.current;
+    if (active) {
+      recognitionRef.current = null;
       try {
-        recognitionRef.current.stop();
+        active.stop();
       } catch {
         // ignore already stopped
       }
-      recognitionRef.current = null;
     }
-    setIsListening(false);
   };
 
   const toggleVoiceInput = () => {
-    if (isListening) {
+    if (isListeningIntentRef.current) {
       stopVoiceInput();
       return;
     }
+
     const Ctor = getSpeechRecognitionCtor();
-    if (!Ctor) return;
+    if (!Ctor) {
+      setVoiceStatus('Voice input is not supported in this browser.');
+      return;
+    }
+
+    // Abort any leftover recognition instance before starting a fresh session
+    if (recognitionRef.current) {
+      const stale = recognitionRef.current;
+      recognitionRef.current = null;
+      try {
+        stale.abort();
+      } catch {
+        // ignore cleanup errors
+      }
+    }
 
     try {
       const recognition = new Ctor();
       recognition.lang = 'en-IN';
       recognition.interimResults = true;
-      recognition.continuous = false;
+      recognition.continuous = true;
+
+      recognition.onstart = () => {
+        if (recognitionRef.current !== recognition) return;
+        isListeningIntentRef.current = true;
+        setIsListening(true);
+        setVoiceStatus(null);
+      };
 
       recognition.onresult = (event: SpeechRecognitionEventLike) => {
+        if (recognitionRef.current !== recognition) return;
         let transcript = '';
         for (let i = 0; i < event.results.length; i++) {
           const item = event.results[i];
@@ -211,22 +246,55 @@ export function FloatingCopilot({
         }
       };
 
-      recognition.onerror = () => {
-        setIsListening(false);
+      recognition.onerror = (event: SpeechRecognitionErrorEventLike) => {
+        if (recognitionRef.current !== recognition) return;
+        const code = event?.error ?? '';
+
+        // Gracefully ignore benign stop / silence events without getting stuck
+        if (code === 'aborted') {
+          if (!isListeningIntentRef.current) return;
+          recognitionRef.current = null;
+          isListeningIntentRef.current = false;
+          setIsListening(false);
+          return;
+        }
+
+        if (code === 'no-speech') {
+          return;
+        }
+
         recognitionRef.current = null;
+        isListeningIntentRef.current = false;
+        setIsListening(false);
+
+        if (code === 'not-allowed' || code === 'service-not-allowed') {
+          setVoiceStatus('Microphone permission denied — allow mic access to speak.');
+        } else if (code === 'audio-capture') {
+          setVoiceStatus('No microphone detected on this device.');
+        } else if (code === 'network') {
+          setVoiceStatus('Voice recognition interrupted by network. Tap mic to retry.');
+        } else {
+          setVoiceStatus('Voice input paused. Tap the mic to try again.');
+        }
       };
 
       recognition.onend = () => {
-        setIsListening(false);
+        if (recognitionRef.current !== recognition) return;
         recognitionRef.current = null;
+        isListeningIntentRef.current = false;
+        setIsListening(false);
       };
 
       recognitionRef.current = recognition;
+      isListeningIntentRef.current = true;
       setIsListening(true);
+      setVoiceStatus(null);
       recognition.start();
     } catch {
-      setIsListening(false);
       recognitionRef.current = null;
+      isListeningIntentRef.current = false;
+      setIsListening(false);
+      setVoiceStatus('Unable to start microphone input. Tap mic to retry.');
     }
   };
 
@@ -384,7 +452,8 @@ export function FloatingCopilot({
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
-    if (isListening) stopVoiceInput();
+    if (isListeningIntentRef.current) stopVoiceInput();
+    setVoiceStatus(null);
     void sendMessage(input);
   };
 
@@ -705,6 +774,17 @@ export function FloatingCopilot({
               <ArrowUp className="h-4 w-4" aria-hidden="true" />
             </button>
           </form>
+
+          {voiceStatus && (
+            <p
+              role="status"
+              aria-live="polite"
+              className="mt-1.5 flex items-center gap-1.5 px-2 text-[11.5px] font-medium text-[#D6281F]"
+            >
+              <AlertCircle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+              <span>{voiceStatus}</span>
+            </p>
+          )}
         </div>
       </div>
     </div>

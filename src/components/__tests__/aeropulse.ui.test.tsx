@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { useState } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { FloatingCopilot } from '../FloatingCopilot';
@@ -511,5 +511,255 @@ describe('AeroPulse Component & Integration Tests', () => {
 
     // Clean up custom window property
     delete (window as unknown as { webkitSpeechRecognition?: unknown }).webkitSpeechRecognition;
+  });
+
+  it('6. isolates uploaded photos, object URL cleanup, and diagnoses strictly per room in RoomAuditTab', async () => {
+    mockBrowserImageAndCanvas();
+
+    let blobCounter = 0;
+    const createObjectUrlSpy = vi
+      .spyOn(URL, 'createObjectURL')
+      .mockImplementation(() => `blob:room-photo-${++blobCounter}`);
+    const revokeObjectUrlSpy = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+
+    vi.spyOn(geminiService, 'analyzeRoomPhotoWithGemini').mockImplementation(async (opts) => ({
+      riskLevel: opts.roomType === 'Kitchen' ? 'Severe' : 'High',
+      fixPotentialPercent: opts.roomType === "Kids' Bedroom" ? 64 : 48,
+      traps: [
+        {
+          id: 1,
+          title: `${opts.roomType} Primary Trap`,
+          x: 40,
+          y: 50,
+          category: 'DIY',
+          costBadge: '₹250',
+          fixAction: `Fix trap in ${opts.roomType}`,
+          whyImpact: `Reduces PM2.5 in ${opts.roomType}.`,
+        },
+      ],
+    }));
+
+    const { unmount } = render(
+      <RoomAuditTab
+        city={createLiveCity()}
+        addedAuditFixKeys={[]}
+        onToggleAddVisionFix={vi.fn()}
+      />
+    );
+
+    await screen.findByText(/Fix trap in Living Room/i);
+
+    // Switch to Kids' Bedroom and upload a photo
+    fireEvent.click(screen.getByRole('button', { name: /Kids' Bedroom/i }));
+    await screen.findByText(/Fix trap in Kids' Bedroom/i);
+
+    const fileInput = screen.getByLabelText(/Upload photo for Kids' Bedroom/i) as HTMLInputElement;
+    const bedroomFile = new File(['bedroom-bytes'], 'bedroom-window.jpg', { type: 'image/jpeg' });
+
+    fireEvent.change(fileInput, { target: { files: [bedroomFile] } });
+    expect(fileInput.value).toBe('');
+
+    await waitFor(() => {
+      expect(screen.getByTestId('active-room-badge')).toHaveTextContent(
+        "Kids' Bedroom (Uploaded)"
+      );
+    });
+
+    const bedroomImg = screen.getByAltText(/Kids' Bedroom \(Uploaded\) indoor air quality/i);
+    const firstBedroomBlob = bedroomImg.getAttribute('src');
+    expect(firstBedroomBlob).toMatch(/^blob:room-photo-/);
+
+    // Switch to Kitchen -> bedroom photo must NOT leak into Kitchen
+    fireEvent.click(screen.getByRole('button', { name: /^Kitchen$/i }));
+    await screen.findByText(/Fix trap in Kitchen/i);
+    expect(screen.getByTestId('active-room-badge')).toHaveTextContent('Gas Kitchen');
+    const kitchenImg = screen.getByRole('img', { name: /indoor air quality vision audit/i });
+    expect(kitchenImg.getAttribute('src')).not.toBe(firstBedroomBlob);
+
+    // Switch to Living Room -> bedroom photo must NOT leak into Living Room
+    fireEvent.click(screen.getByRole('button', { name: /^Living Room$/i }));
+    await screen.findByText(/Fix trap in Living Room/i);
+    const livingImg = screen.getByRole('img', { name: /indoor air quality vision audit/i });
+    expect(livingImg.getAttribute('src')).not.toBe(firstBedroomBlob);
+
+    // Switch back to Kids' Bedroom -> uploaded photo is still preserved
+    fireEvent.click(screen.getByRole('button', { name: /Kids' Bedroom/i }));
+    expect(screen.getByTestId('active-room-badge')).toHaveTextContent("Kids' Bedroom (Uploaded)");
+    expect(
+      screen.getByAltText(/Kids' Bedroom \(Uploaded\) indoor air quality/i).getAttribute('src')
+    ).toBe(firstBedroomBlob);
+
+    // Re-upload the same file -> triggers onChange cleanly & revokes previous blob URL
+    const reuploadInput = screen.getByLabelText(
+      /Upload photo for Kids' Bedroom/i
+    ) as HTMLInputElement;
+    fireEvent.change(reuploadInput, { target: { files: [bedroomFile] } });
+
+    await waitFor(() => {
+      expect(revokeObjectUrlSpy).toHaveBeenCalledWith(firstBedroomBlob);
+    });
+    const secondBedroomBlob = screen
+      .getByAltText(/Kids' Bedroom \(Uploaded\) indoor air quality/i)
+      .getAttribute('src');
+    expect(secondBedroomBlob).toMatch(/^blob:room-photo-/);
+    expect(secondBedroomBlob).not.toBe(firstBedroomBlob);
+
+    // Reset Kids' Bedroom photo -> revokes its second blob URL without affecting other rooms
+    fireEvent.click(screen.getByRole('button', { name: /Reset Kids' Bedroom photo/i }));
+    expect(revokeObjectUrlSpy).toHaveBeenCalledWith(secondBedroomBlob);
+    expect(screen.getByTestId('active-room-badge')).not.toHaveTextContent(/Uploaded/i);
+
+    expect(createObjectUrlSpy).toHaveBeenCalled();
+    unmount();
+  });
+
+  it('7. keeps FloatingCopilot microphone toggle stable across re-renders and handles speech errors cleanly', () => {
+    interface MockSpeechInstance {
+      lang: string;
+      interimResults: boolean;
+      continuous: boolean;
+      onstart: (() => void) | null;
+      onresult: ((event: { resultIndex: number; results: { length: number; [k: number]: { isFinal: boolean; length: number; [j: number]: { transcript: string } } } }) => void) | null;
+      onerror: ((event: { error?: string }) => void) | null;
+      onend: (() => void) | null;
+      start: ReturnType<typeof vi.fn>;
+      stop: ReturnType<typeof vi.fn>;
+      abort: ReturnType<typeof vi.fn>;
+    }
+
+    const instances: MockSpeechInstance[] = [];
+
+    class StableMockSpeechRecognition implements MockSpeechInstance {
+      lang = 'en-IN';
+      interimResults = true;
+      continuous = false;
+      onstart: (() => void) | null = null;
+      onresult: MockSpeechInstance['onresult'] = null;
+      onerror: MockSpeechInstance['onerror'] = null;
+      onend: (() => void) | null = null;
+      start = vi.fn();
+      stop = vi.fn();
+      abort = vi.fn();
+      constructor() {
+        instances.push(this);
+      }
+    }
+
+    Object.defineProperty(window, 'SpeechRecognition', {
+      configurable: true,
+      writable: true,
+      value: StableMockSpeechRecognition,
+    });
+
+    const baseCity = createLiveCity({ name: 'Delhi', aqi: 185 });
+    const mockContext: LiveAppContext = {
+      activeTab: 'Today',
+      telemetry: {
+        city: baseCity.name,
+        state: baseCity.state,
+        aqi: baseCity.aqi,
+        severityLabel: baseCity.severityLabel,
+        pm25: baseCity.pm25,
+        pm10: baseCity.pm10,
+        no2: baseCity.no2,
+        o3: baseCity.o3,
+        safeWindowLabel: baseCity.safeWindowLabel,
+        hourlySummary: '6A: 240',
+        isLive: true,
+      },
+      profile: { personaId: 'parent', personaLabel: 'Parent', riskChips: [] },
+      roomAudit: null,
+      commute: null,
+      activeHabits: [],
+    };
+
+    const { rerender, unmount } = render(
+      <FloatingCopilot
+        activeTab="today"
+        city={baseCity}
+        persona="parent"
+        personaLabel="Parent"
+        getLiveAppContext={() => mockContext}
+        onOpenMapRoute={vi.fn()}
+      />
+    );
+
+    // Click mic to start listening
+    const startMicBtn = screen.getByRole('button', { name: /Speak question to AeroPulse/i });
+    fireEvent.click(startMicBtn);
+
+    expect(instances).toHaveLength(1);
+    const first = instances[0];
+    expect(first.start).toHaveBeenCalledTimes(1);
+    expect(first.continuous).toBe(true);
+
+    const stopMicBtn = screen.getByRole('button', { name: /Stop voice input/i });
+    expect(stopMicBtn).toHaveAttribute('aria-pressed', 'true');
+
+    // Simulate onstart + transcript result -> triggers input re-render without recreating recognition
+    act(() => {
+      first.onstart?.();
+      first.onresult?.({
+        resultIndex: 0,
+        results: {
+          length: 1,
+          0: { isFinal: false, length: 1, 0: { transcript: 'best mask for delhi' } },
+        },
+      });
+    });
+
+    expect(screen.getByDisplayValue('best mask for delhi')).toBeInTheDocument();
+    expect(instances).toHaveLength(1);
+    expect(first.stop).not.toHaveBeenCalled();
+
+    // Parent prop update re-renders FloatingCopilot -> recognition remains active without flicker
+    rerender(
+      <FloatingCopilot
+        activeTab="today"
+        city={createLiveCity({ name: 'Delhi', aqi: 192 })}
+        persona="parent"
+        personaLabel="Parent"
+        getLiveAppContext={() => mockContext}
+        onOpenMapRoute={vi.fn()}
+      />
+    );
+    expect(instances).toHaveLength(1);
+    expect(screen.getByRole('button', { name: /Stop voice input/i })).toHaveAttribute(
+      'aria-pressed',
+      'true'
+    );
+
+    // Benign no-speech event does not surface an error banner or kill state
+    act(() => {
+      first.onerror?.({ error: 'no-speech' });
+    });
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+
+    // Permission error surfaces clear status message and resets listening state cleanly
+    act(() => {
+      first.onerror?.({ error: 'not-allowed' });
+    });
+    expect(screen.getByRole('status')).toHaveTextContent(/Microphone permission denied/i);
+    expect(screen.getByRole('button', { name: /Speak question to AeroPulse/i })).toHaveAttribute(
+      'aria-pressed',
+      'false'
+    );
+
+    // Start again, then click mic again to stop cleanly
+    fireEvent.click(screen.getByRole('button', { name: /Speak question to AeroPulse/i }));
+    expect(instances).toHaveLength(2);
+    const second = instances[1];
+    expect(second.start).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /Stop voice input/i }));
+    expect(second.stop).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: /Speak question to AeroPulse/i })).toHaveAttribute(
+      'aria-pressed',
+      'false'
+    );
+
+    unmount();
+    delete (window as unknown as { SpeechRecognition?: unknown }).SpeechRecognition;
   });
 });

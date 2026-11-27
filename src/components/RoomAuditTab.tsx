@@ -115,6 +115,65 @@ function getRiskBadgeStyle(riskLevel: VisionRiskLevel): string {
   }
 }
 
+interface RoomAuditSlotState {
+  presetId: RoomPresetId;
+  riskFlags: RoomRiskFlag[];
+  uploadedPreviewUrl: string | null;
+  uploadedBase64: string | null;
+  uploadedLabel: string | null;
+  imageError: boolean;
+  selectedPinId: number;
+  diagnosis: RoomVisionDiagnosis | null;
+  isScanning: boolean;
+  scanError: string | null;
+}
+
+const DEFAULT_ROOM_CONFIG: Record<
+  RoomCategory,
+  { presetId: RoomPresetId; riskFlags: RoomRiskFlag[] }
+> = {
+  living: { presetId: 'balcony-door', riskFlags: ['mainRoad'] },
+  kitchen: { presetId: 'gas-kitchen', riskFlags: ['gasStove'] },
+  kids: { presetId: 'kids-study', riskFlags: ['noPurifier'] },
+  balcony: { presetId: 'balcony-door', riskFlags: ['mainRoad'] },
+};
+
+function createDefaultRoomSlot(roomId: RoomCategory): RoomAuditSlotState {
+  const cfg = DEFAULT_ROOM_CONFIG[roomId];
+  return {
+    presetId: cfg.presetId,
+    riskFlags: [...cfg.riskFlags],
+    uploadedPreviewUrl: null,
+    uploadedBase64: null,
+    uploadedLabel: null,
+    imageError: false,
+    selectedPinId: 1,
+    diagnosis: null,
+    isScanning: false,
+    scanError: null,
+  };
+}
+
+function createInitialRoomStates(): Record<RoomCategory, RoomAuditSlotState> {
+  return {
+    living: createDefaultRoomSlot('living'),
+    kitchen: createDefaultRoomSlot('kitchen'),
+    kids: createDefaultRoomSlot('kids'),
+    balcony: createDefaultRoomSlot('balcony'),
+  };
+}
+
+function revokeBlobUrl(url: string | null | undefined) {
+  if (
+    url &&
+    url.startsWith('blob:') &&
+    typeof URL !== 'undefined' &&
+    typeof URL.revokeObjectURL === 'function'
+  ) {
+    URL.revokeObjectURL(url);
+  }
+}
+
 function mapCategoryToBudget(category: RoomVisionTrap['category']): Exclude<BudgetTier, 'all'> {
   if (category === 'Free') return 'free';
   if (category === 'DIY') return 'diy';
@@ -128,26 +187,54 @@ export function RoomAuditTab({
   onSnapshotChange,
 }: RoomAuditTabProps) {
   const [selectedRoom, setSelectedRoom] = useState<RoomCategory>('living');
-  const [activePresetId, setActivePresetId] = useState<RoomPresetId>('balcony-door');
-  const [riskFlags, setRiskFlags] = useState<RoomRiskFlag[]>(['mainRoad']);
-  const [selectedPinId, setSelectedPinId] = useState<number>(1);
+  const [roomStates, setRoomStates] =
+    useState<Record<RoomCategory, RoomAuditSlotState>>(createInitialRoomStates);
   const [glowingCardId, setGlowingCardId] = useState<number | null>(null);
   const [pinPulseCounter, setPinPulseCounter] = useState<Record<number, number>>({});
   const [budgetFilter, setBudgetFilter] = useState<BudgetTier>('all');
 
-  const [uploadedPreviewUrl, setUploadedPreviewUrl] = useState<string | null>(null);
-  const [uploadedBase64, setUploadedBase64] = useState<string | null>(null);
-  const [uploadedLabel, setUploadedLabel] = useState<string | null>(null);
-  const [imageError, setImageError] = useState<boolean>(false);
-
-  const [isScanning, setIsScanning] = useState<boolean>(false);
-  const [diagnosis, setDiagnosis] = useState<RoomVisionDiagnosis | null>(null);
-  const [scanError, setScanError] = useState<string | null>(null);
-
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cardRefs = useRef<Record<number, HTMLElement | null>>({});
   const glowTimerRef = useRef<number | null>(null);
-  const scanReqIdRef = useRef<number>(0);
+  const roomStatesRef = useRef<Record<RoomCategory, RoomAuditSlotState>>(roomStates);
+  roomStatesRef.current = roomStates;
+
+  const scanReqIdsRef = useRef<Record<RoomCategory, number>>({
+    living: 0,
+    kitchen: 0,
+    kids: 0,
+    balcony: 0,
+  });
+  const lastScannedSigRef = useRef<Record<RoomCategory, string | null>>({
+    living: null,
+    kitchen: null,
+    kids: null,
+    balcony: null,
+  });
+
+  const updateRoomState = useCallback(
+    (roomId: RoomCategory, updater: (prev: RoomAuditSlotState) => RoomAuditSlotState) => {
+      setRoomStates((prev) => ({
+        ...prev,
+        [roomId]: updater(prev[roomId]),
+      }));
+    },
+    []
+  );
+
+  const activeRoomState = roomStates[selectedRoom];
+  const {
+    presetId: activePresetId,
+    riskFlags,
+    selectedPinId,
+    uploadedPreviewUrl,
+    uploadedBase64,
+    uploadedLabel,
+    imageError,
+    isScanning,
+    diagnosis,
+    scanError,
+  } = activeRoomState;
 
   const preset =
     ROOM_AUDIT_PRESETS.find((p) => p.id === activePresetId) ?? ROOM_AUDIT_PRESETS[0];
@@ -159,23 +246,28 @@ export function RoomAuditTab({
 
   const runVisionDiagnosis = useCallback(
     async (opts: {
+      roomId: RoomCategory;
       source: File | string;
       precompressedBase64?: string | null;
       roomLabel: string;
       activeRiskFlags: RoomRiskFlag[];
       activeCity: CityAirProfile;
-      cacheSignature?: string;
+      cacheSignature: string;
       forceRefresh?: boolean;
     }) => {
-      const reqId = ++scanReqIdRef.current;
-      setIsScanning(true);
-      setScanError(null);
+      const reqId = ++scanReqIdsRef.current[opts.roomId];
+      lastScannedSigRef.current[opts.roomId] = opts.cacheSignature;
+      updateRoomState(opts.roomId, (prev) => ({
+        ...prev,
+        isScanning: true,
+        scanError: null,
+      }));
 
       try {
         let base64Payload = opts.precompressedBase64 || '';
         if (!base64Payload) {
           const compressed = await compressImageToJpeg(opts.source, 1024, 0.8);
-          if (reqId !== scanReqIdRef.current) return;
+          if (reqId !== scanReqIdsRef.current[opts.roomId]) return;
           base64Payload = compressed.base64;
         }
 
@@ -194,53 +286,53 @@ export function RoomAuditTab({
           forceRefresh: opts.forceRefresh,
         });
 
-        if (reqId !== scanReqIdRef.current) return;
+        if (reqId !== scanReqIdsRef.current[opts.roomId]) return;
 
-        setDiagnosis(data);
-        if (data.traps.length > 0) {
-          setSelectedPinId(data.traps[0].id);
-        }
+        updateRoomState(opts.roomId, (prev) => ({
+          ...prev,
+          diagnosis: data,
+          selectedPinId: data.traps.length > 0 ? data.traps[0].id : prev.selectedPinId,
+        }));
       } catch (err) {
-        if (reqId === scanReqIdRef.current) {
-          setScanError(
-            err instanceof Error
-              ? err.message
-              : 'Network error during Gemini Vision room scan.'
-          );
+        if (reqId === scanReqIdsRef.current[opts.roomId]) {
+          updateRoomState(opts.roomId, (prev) => ({
+            ...prev,
+            scanError:
+              err instanceof Error
+                ? err.message
+                : 'Network error during Gemini Vision room scan.',
+          }));
         }
       } finally {
-        if (reqId === scanReqIdRef.current) {
-          setIsScanning(false);
+        if (reqId === scanReqIdsRef.current[opts.roomId]) {
+          updateRoomState(opts.roomId, (prev) => ({
+            ...prev,
+            isScanning: false,
+          }));
         }
       }
     },
-    []
+    [updateRoomState]
   );
 
-  // Trigger Gemini Vision automatically when photo, preset, room type, city, or risk chips change
+  // Trigger Gemini Vision automatically when the active room's photo, preset, city, or risk chips change
+  const activeSignature = `${selectedRoom}|${city.id}|${Math.round(city.aqi / 10) * 10}|${activeRoomLabel}|${riskFlags.slice().sort().join(',')}|${uploadedLabel ?? preset.id}|${uploadedPreviewUrl ?? ''}`;
+
   useEffect(() => {
-    const signature = `${city.id}|${Math.round(city.aqi / 10) * 10}|${activeRoomLabel}|${riskFlags.slice().sort().join(',')}|${uploadedLabel ?? preset.id}`;
+    if (lastScannedSigRef.current[selectedRoom] === activeSignature) return;
     void runVisionDiagnosis({
+      roomId: selectedRoom,
       source: uploadedPreviewUrl ?? preset.imageUrl,
       precompressedBase64: uploadedBase64,
       roomLabel: activeRoomLabel,
       activeRiskFlags: riskFlags,
       activeCity: city,
-      cacheSignature: signature,
+      cacheSignature: activeSignature,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    preset.id,
-    preset.imageUrl,
-    uploadedPreviewUrl,
-    uploadedBase64,
-    selectedRoom,
-    city.id,
-    city.aqi,
-    riskFlags.join(','),
-  ]);
+  }, [activeSignature, selectedRoom]);
 
-  // Sync Room Audit diagnosis & active risk flags into global App state for the Copilot
+  // Sync active Room Audit diagnosis & risk flags into global App state for the Copilot
   useEffect(() => {
     onSnapshotChange?.({
       roomLabel: activeContextLabel,
@@ -249,74 +341,111 @@ export function RoomAuditTab({
     });
   }, [activeContextLabel, riskFlags, diagnosis, onSnapshotChange]);
 
-  // Clear glow timer on unmount
+  // Clear glow timer and revoke any active blob object URLs on unmount
   useEffect(() => {
     return () => {
       if (glowTimerRef.current) window.clearTimeout(glowTimerRef.current);
+      Object.values(roomStatesRef.current).forEach((slot) => {
+        revokeBlobUrl(slot.uploadedPreviewUrl);
+      });
     };
   }, []);
 
   const handleSelectPreset = (presetId: RoomPresetId, roomCat: RoomCategory) => {
-    setUploadedPreviewUrl(null);
-    setUploadedBase64(null);
-    setUploadedLabel(null);
-    setImageError(false);
-    setActivePresetId(presetId);
+    revokeBlobUrl(roomStatesRef.current[roomCat].uploadedPreviewUrl);
+    lastScannedSigRef.current[roomCat] = null;
+    updateRoomState(roomCat, (prev) => ({
+      ...prev,
+      presetId,
+      uploadedPreviewUrl: null,
+      uploadedBase64: null,
+      uploadedLabel: null,
+      imageError: false,
+      scanError: null,
+    }));
     setSelectedRoom(roomCat);
     setBudgetFilter('all');
   };
 
   const handleRoomPillClick = (room: (typeof ROOM_PILLS)[number]) => {
     setSelectedRoom(room.id);
-    if (!uploadedPreviewUrl && room.presetId !== activePresetId) {
-      setActivePresetId(room.presetId);
-    }
+    setBudgetFilter('all');
+  };
+
+  const handleResetCurrentRoom = () => {
+    const targetRoom = selectedRoom;
+    revokeBlobUrl(roomStatesRef.current[targetRoom].uploadedPreviewUrl);
+    lastScannedSigRef.current[targetRoom] = null;
+    updateRoomState(targetRoom, () => createDefaultRoomSlot(targetRoom));
     setBudgetFilter('all');
   };
 
   const toggleRiskFlag = (flag: RoomRiskFlag) => {
-    setRiskFlags((prev) =>
-      prev.includes(flag) ? prev.filter((f) => f !== flag) : [...prev, flag]
-    );
+    updateRoomState(selectedRoom, (prev) => ({
+      ...prev,
+      riskFlags: prev.riskFlags.includes(flag)
+        ? prev.riskFlags.filter((f) => f !== flag)
+        : [...prev.riskFlags, flag],
+    }));
   };
 
   const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    e.target.value = '';
+    const file = e.currentTarget.files?.[0];
+    e.currentTarget.value = '';
     if (!file) return;
 
-    setImageError(false);
-    setScanError(null);
-    setIsScanning(true);
+    const targetRoom = selectedRoom;
+    const prevPreviewUrl = roomStatesRef.current[targetRoom].uploadedPreviewUrl;
+    const nextObjectUrl =
+      typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function'
+        ? URL.createObjectURL(file)
+        : null;
+
+    updateRoomState(targetRoom, (prev) => ({
+      ...prev,
+      imageError: false,
+      scanError: null,
+      isScanning: true,
+    }));
 
     try {
       const compressed = await compressImageToJpeg(file, 1024, 0.8);
-      setUploadedPreviewUrl(compressed.dataUrl);
-      setUploadedBase64(compressed.base64);
-      setUploadedLabel(file.name.replace(/\.[^.]+$/, ''));
+      revokeBlobUrl(prevPreviewUrl);
+      lastScannedSigRef.current[targetRoom] = null;
+      updateRoomState(targetRoom, (prev) => ({
+        ...prev,
+        uploadedPreviewUrl: nextObjectUrl ?? compressed.dataUrl,
+        uploadedBase64: compressed.base64,
+        uploadedLabel: file.name.replace(/\.[^.]+$/, ''),
+        imageError: false,
+      }));
       setBudgetFilter('all');
     } catch {
-      setIsScanning(false);
-      setScanError('Could not read that image file. Please try a JPG or PNG photo.');
+      revokeBlobUrl(nextObjectUrl);
+      updateRoomState(targetRoom, (prev) => ({
+        ...prev,
+        isScanning: false,
+        scanError: 'Could not read that image file. Please try a JPG or PNG photo.',
+      }));
     }
   };
 
   const handleRetryScan = () => {
-    const signature = `${city.id}|${Math.round(city.aqi / 10) * 10}|${activeRoomLabel}|${riskFlags.slice().sort().join(',')}|${uploadedLabel ?? preset.id}`;
     void runVisionDiagnosis({
+      roomId: selectedRoom,
       source: uploadedPreviewUrl ?? preset.imageUrl,
       precompressedBase64: uploadedBase64,
       roomLabel: activeRoomLabel,
       activeRiskFlags: riskFlags,
       activeCity: city,
-      cacheSignature: signature,
+      cacheSignature: activeSignature,
       forceRefresh: true,
     });
   };
 
   // Click Pin on Photo → Highlight + smooth scroll to linked Fix Card with brief Emerald glow ring
   const handlePinClick = (pinId: number) => {
-    setSelectedPinId(pinId);
+    updateRoomState(selectedRoom, (prev) => ({ ...prev, selectedPinId: pinId }));
     setBudgetFilter('all');
     setGlowingCardId(pinId);
     if (glowTimerRef.current) window.clearTimeout(glowTimerRef.current);
@@ -334,7 +463,7 @@ export function RoomAuditTab({
 
   // Click Fix Card → Pulse its corresponding AR pin on the photo
   const handleCardClick = (pinId: number) => {
-    setSelectedPinId(pinId);
+    updateRoomState(selectedRoom, (prev) => ({ ...prev, selectedPinId: pinId }));
     setPinPulseCounter((prev) => ({
       ...prev,
       [pinId]: (prev[pinId] || 0) + 1,
@@ -354,9 +483,11 @@ export function RoomAuditTab({
   const indoorRiskColor = getRiskBadgeStyle(indoorRiskLabel);
   const fixPotential = diagnosis?.fixPotentialPercent ?? 0;
 
-  const sourceSlug = uploadedLabel
-    ? `upload-${uploadedLabel.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`
-    : preset.id;
+  const sourceSlug = `${selectedRoom}-${
+    uploadedLabel
+      ? `upload-${uploadedLabel.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`
+      : preset.id
+  }`;
 
   return (
     <div className="space-y-6 pb-32">
@@ -417,7 +548,9 @@ export function RoomAuditTab({
                 src={activePhotoSrc}
                 alt={`${activeContextLabel} indoor air quality vision audit`}
                 referrerPolicy="no-referrer"
-                onError={() => setImageError(true)}
+                onError={() =>
+                  updateRoomState(selectedRoom, (prev) => ({ ...prev, imageError: true }))
+                }
                 className="h-full w-full object-cover transition-transform duration-500"
               />
             ) : (
@@ -454,11 +587,20 @@ export function RoomAuditTab({
               />
               <span>
                 {isScanning
-                  ? 'Scanning airflow & smog traps...'
+                  ? `Scanning ${activeRoomLabel}...`
                   : scanError
                     ? 'Vision Scan Paused'
                     : `Gemini Vision • ${traps.length} Traps Mapped`}
               </span>
+            </div>
+
+            {/* Top-Right Active Room Badge */}
+            <div
+              data-testid="active-room-badge"
+              className="absolute right-4 top-4 z-20 inline-flex items-center gap-1.5 rounded-full bg-white/90 px-3 py-1 text-[11.5px] font-bold text-[#0F172A] shadow-xs backdrop-blur-md ring-1 ring-slate-200/80"
+            >
+              <span className="h-2 w-2 rounded-full bg-[#34C759]" aria-hidden="true" />
+              <span>{activeContextLabel}</span>
             </div>
 
             {/* Dynamic Pulsing AR Hotspot Pins at Gemini (x%, y%) Coordinates */}
@@ -523,13 +665,14 @@ export function RoomAuditTab({
             </div>
           </div>
 
-          {/* Bottom Bar inside Scanner Card: Upload Room Photo + 3 Sample Presets */}
+          {/* Bottom Bar inside Scanner Card: Upload Room Photo + Per-Room Reset + 3 Sample Presets */}
           <div className="mt-4 flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <input
                 ref={fileInputRef}
                 type="file"
                 accept="image/*"
+                aria-label={`Upload photo for ${activeRoomLabel}`}
                 onChange={handlePhotoUpload}
                 className="hidden"
               />
@@ -540,8 +683,20 @@ export function RoomAuditTab({
                 className="apple-press inline-flex h-10 shrink-0 items-center gap-2 rounded-full bg-[#0F172A] px-4 text-[13px] font-semibold text-white shadow-sm hover:bg-slate-800 disabled:opacity-60 whitespace-nowrap"
               >
                 <Upload className="h-3.5 w-3.5" aria-hidden="true" />
-                Upload Room Photo
+                Upload {activeRoomLabel} Photo
               </button>
+
+              {uploadedPreviewUrl && (
+                <button
+                  type="button"
+                  onClick={handleResetCurrentRoom}
+                  aria-label={`Reset ${activeRoomLabel} photo`}
+                  className="apple-press inline-flex h-10 shrink-0 items-center gap-1.5 rounded-full border border-slate-200/90 bg-white px-3.5 text-[12px] font-semibold text-[#475569] hover:bg-slate-50 hover:text-[#0F172A] whitespace-nowrap"
+                >
+                  <RefreshCw className="h-3 w-3" aria-hidden="true" />
+                  Reset Room
+                </button>
+              )}
             </div>
 
             <div className="flex flex-wrap items-center gap-1.5">
@@ -573,14 +728,14 @@ export function RoomAuditTab({
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-1.5 text-[12px] font-semibold text-[#64748B]">
                 <Sparkles className="h-3.5 w-3.5 text-[#34C759]" aria-hidden="true" />
-                Gemini Vision • {activeContextLabel}
+                <span>Gemini Vision • {activeContextLabel}</span>
               </div>
 
               {!isScanning && (
                 <button
                   type="button"
                   onClick={handleRetryScan}
-                  aria-label="Re-scan room with Gemini Vision"
+                  aria-label={`Re-scan ${activeRoomLabel} with Gemini Vision`}
                   className="apple-press inline-flex items-center gap-1 rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-semibold text-[#475569] hover:bg-slate-200/80 hover:text-[#0F172A]"
                 >
                   <RefreshCw className="h-3 w-3" aria-hidden="true" />
